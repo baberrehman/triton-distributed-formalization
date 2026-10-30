@@ -1,10 +1,37 @@
 # Lean and Lake build outputs
 .lake/
 
+# Lean-generated environment and build metadata
+*.olean
+*.ilean
+*.c
+*.trace
+
+# LaTeX build outputs (keep source, bibliography, class, and PDF trackable)
+paper/*.aux
+paper/*.bbl
+paper/*.blg
+paper/*.log
+paper/*.out
+paper/*.toc
+paper/*.vtc
+paper/*.synctex.gz
+
 # Python bytecode and test caches
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Coverage and local test reports
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Local temporary files
+*.swp
+*.swo
+*~
 
 # Editor and OS metadata
 .vscode/
