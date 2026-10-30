@@ -161,6 +161,72 @@ successful wait. The transition-level pending and consumed capabilities provide
 that stronger fact. Thus the main result is a protocol refinement of the
 ordinary type system, not a claim that the token type itself encodes lineage.
 
+\subsubsection{Typing rules}
+For reference, the principal typing rules can be displayed compactly as
+follows. The variable rule reads the optional binding from the context:
+\[
+\frac{\Gamma.vars(x)=\mathsf{some}\ \tau}
+  {\Gamma\vdash x:\tau}
+\qquad
+\frac{}{\Gamma\vdash \mathsf{rank}(a):\mathsf{i32}_1}
+\qquad
+\frac{}{\Gamma\vdash \mathsf{numRanks}(a):\mathsf{i32}_1}.
+\]
+Symmetric addressing preserves the operand type while checking the target:
+\[
+\frac{\Gamma\vdash e:\tau \qquad r<\Gamma.world}
+  {\Gamma\vdash \mathsf{symmAt}(e,r):\tau}.
+\]
+Writing \(\mathsf{i32}_1\) and \(\mathsf{i64}_1\) for scalar types and
+\(\mathsf{i32}_0\) for unit, the synchronization rules are:
+\[
+\frac{\Gamma\vdash p:\mathsf{i64}_1\quad
+   \Gamma\vdash r:\mathsf{i32}_1\quad
+   \Gamma\vdash v:\mathsf{i64}_1}
+  {\Gamma\vdash \mathsf{notify}(p,r,v,b,s):\mathsf{i32}_0}
+\]
+and
+\[
+\frac{\Gamma\vdash p:\mathsf{i64}_1\quad
+   \Gamma\vdash n:\mathsf{i32}_1\quad
+   \Gamma\vdash v:\mathsf{i64}_1}
+  {\Gamma\vdash \mathsf{wait}(p,n,v,s,o):\mathsf{i32}_1}.
+\]
+The consume rule is polymorphic in the value type but fixes the token type:
+\[
+\frac{\Gamma\vdash v:\tau\qquad\Gamma\vdash t:\mathsf{i32}_1}
+  {\Gamma\vdash \mathsf{consumeToken}(v,t):\tau}.
+\]
+The load rule preserves its operand type, and the store rule requires matching
+operand types and returns unit:
+\[
+\frac{\Gamma\vdash p:\tau}{\Gamma\vdash \mathsf{load}(p):\tau}
+\qquad
+\frac{\Gamma\vdash p:\tau\quad\Gamma\vdash v:\tau}
+  {\Gamma\vdash \mathsf{store}(p,v):\mathsf{i32}_0}.
+\]
+These rules are a direct mathematical rendering of the constructors of
+\texttt{HasType}; they are not an independently implemented type checker.
+
+\subsubsection{Runtime typing judgments}
+Static typing is paired with three runtime predicates. First,
+\texttt{ValueHasType W v $\tau$} relates a value to a type under a world size.
+For a pointer it requires the stored element type to equal \(\tau\) and the
+owner rank to be below \(W\). For a tile it additionally requires the payload
+length to equal the declared size. Tokens are deliberately typed as
+\(\mathsf{i32}_1\), so their protocol metadata is not part of the ordinary
+type identity. Second, \texttt{EnvHasType $\Gamma$ $\rho$} is pointwise:
+\[
+\frac{\Gamma.vars(x)=\mathsf{some}\ \tau\quad
+   \rho(x)=\mathsf{some}\ v}
+  {\mathsf{EnvHasType}(\Gamma,\rho)\ \text{requires}\
+   \mathsf{ValueHasType}(\Gamma.world,v,\tau)}.
+\]
+Third, \texttt{StoreWellTyped $\sigma$} quantifies over every declared and
+present cell and requires its value to have the declared type. Together these
+predicates state the runtime portion of type safety without requiring every
+variable to be initialized.
+
 \subsection{Value and store typing}
 The predicate \texttt{ValueHasType W v $\tau$} is defined by cases on the
 value. A tile has the declared type and a payload whose list length equals the
@@ -212,6 +278,83 @@ the declared cell type.
 These are local theorems for a fixed state and environment. They do not imply
 determinism of a distributed execution, and they do not establish the
 capability invariant. That invariant is proved over the transition trace.
+
+\subsection{Type-safety theorems}
+The artifact's type-safety results are preservation-style theorems for the
+encoded language and machine. They should be distinguished from the provenance
+theorem: type safety establishes that values have the declared shapes, whereas
+provenance establishes that a load has a synchronization history.
+
+\paragraph{Expression safety.}
+The theorem \texttt{eval\_var\_preservation} states that if
+\(\Gamma\vdash \mathsf{var}(x):\tau\), the environment is well typed, the
+context and state have equal world sizes, and evaluation returns \(v\), then
+\[
+ \mathsf{ValueHasType}(\sigma.world,v,\tau).
+\]
+This is the fundamental environment lookup lemma. The theorem
+\texttt{eval\_rank\_preservation} specializes it to rank queries and proves
+that the returned current rank has type \(\mathsf{i32}_1\). The theorem
+\texttt{eval\_wait\_preservation} proves that every successful wait result
+has type \(\mathsf{i32}_1\), the static token type. Importantly, it does not
+claim that the token has a valid pending origin.
+
+Theorem \texttt{eval\_symmAt\_safe} states that a successful symmetric
+addressing evaluation returns a pointer whose element type is the input type
+and whose target rank is within the state world. Its proof inverts the
+\texttt{Eval.symmAt} derivation and combines pointer typing with the target
+bound. The theorem \texttt{eval\_load\_preservation} uses a
+\texttt{StoreWellTyped} premise: if a load evaluates successfully, then there
+exist a cell type, rank, and address such that the returned value has that
+cell type. This existential conclusion matches the current evaluator, whose
+load rule obtains the cell type from the state rather than carrying it in the
+result type.
+
+\paragraph{Machine safety.}
+The transition module packages runtime safety as
+\[
+\mathsf{WellTypedMachine}(\Gamma,m) \;\triangleq\;
+ \Gamma.world=m.state.world\ \land\
+ \mathsf{EnvHasType}(\Gamma,m.env)\ \land\
+ \mathsf{StoreWellTyped}(m.state).
+\]
+The theorem \texttt{step\_preserves\_well\_typed} proves
+\[
+ \mathsf{WellTypedMachine}(\Gamma,m)\land
+ \mathsf{Step}(m,a,m')
+ \Longrightarrow
+ \mathsf{WellTypedMachine}(\Gamma,m').
+\]
+The proof is by cases on the step constructor. Notifications change only the
+signal function, and the point-update definitions preserve the world and all
+memory cells. Wait, consume, and load leave the state, environment, and cell
+typing unchanged. The theorem therefore exposes a useful limitation: the
+current transition system has no data-changing store step, so it proves
+preservation rather than a full subject-reduction theorem for mutable programs.
+
+Induction over \texttt{Trace} lifts the step result to
+\texttt{trace\_preserves\_well\_typed}:
+\[
+ \mathsf{WellTypedMachine}(\Gamma,m_1)\land
+ \mathsf{Trace}(m_1,A,m_2)
+ \Longrightarrow
+ \mathsf{WellTypedMachine}(\Gamma,m_2).
+\]
+The separate theorem \texttt{trace\_preserves\_world} proves that the state
+world remains equal to the context world along the same trace. These are the
+paper's explicit type-safety theorems. They establish preservation of the
+formal runtime invariants under every admitted transition, not safety of
+arbitrary source programs or generated accelerator code.
+
+\paragraph{Safety boundary.}
+The type system rejects malformed expression shapes such as a wait whose
+signal operand is not an \(\mathsf{i64}\) scalar pointer or a consume whose
+token operand is not \(\mathsf{i32}_1\). It does not reject every protocol
+mistake: an integer-typed token with fabricated metadata remains a well-typed
+value. Such a value is rejected by the transition consume premise when no
+matching pending capability exists. This division of labor is central to the
+formalization: static typing protects representation invariants, while the
+capability trace protects synchronization provenance.
 
 Signal updates are state-changing transitions. A set notification assigns a signal value; an add notification increments it. A wait transition is enabled when the expected value is no greater than the current signal value and the explicit predicate \texttt{NotificationVisible} holds. A successful wait adds a witness and a pending-token capability. The predicate is a premise: it is not derived from a hardware memory model.
 
@@ -376,23 +519,25 @@ are different obligations.
 \centering
 \caption{Selected theorem contracts in the Lean artifact.}
 \label{tab:theorems}
-\small
-\begin{tabular}{p{.25\linewidth}p{.66\linewidth}}
+\scriptsize
+\setlength{\tabcolsep}{2pt}
+\begin{tabular}{>{\raggedright\arraybackslash}p{.40\linewidth}
+                >{\raggedright\arraybackslash}p{.51\linewidth}}
 \hline
 Theorem & Contract \\
 \hline
-\texttt{eval\_deterministic} & One expression has one result in a fixed state and environment.\\
-\texttt{eval\_var\_preservation} & A typed variable returns a value of the context type.\\
-\texttt{eval\_wait\_preservation} & A successful wait returns a scalar token.\\
-\texttt{eval\_symmAt\_safe} & Symmetric addressing preserves type and bounds.\\
-\texttt{eval\_load\_preservation} & A successful load is covered by store typing.\\
-\texttt{wait\_success\_has\_visible\_notification} & A successful wait exposes visibility.\\
-\texttt{notify\_set/add\_preserves\_signals} & Notification changes only its signal cell.\\
-\texttt{wait\_step\_adds\_witness} & Wait adds a witness and pending token.\\
-\texttt{consume\_requires\_wait\_token} & Consume has a matching pending capability.\\
-\texttt{load\_requires\_ordering\_witness} & Load has a matching consumed ordering.\\
-\texttt{trace\_preserves\_capability\_origins} & Capabilities have wait/consume origins.\\
-\texttt{load\_has\_prior\_wait\_and\_consume} & A permitted load follows matching wait and consume.\\
+Eval.1 & One expression has one result in a fixed state and environment.\\
+Eval.2 & A typed variable returns a value of the context type.\\
+Eval.3 & A successful wait returns a scalar token.\\
+Eval.4 & Symmetric addressing preserves type and bounds.\\
+Eval.5 & A successful load is covered by store typing.\\
+Step.1 & A successful wait exposes visibility.\\
+Step.2 & Notification changes only its signal cell.\\
+Step.3 & Wait adds a witness and pending token.\\
+Step.4 & Consume has a matching pending capability.\\
+Step.5 & Load has a matching consumed ordering.\\
+Trace.1 & Capabilities have wait/consume origins.\\
+Trace.2 & A permitted load follows matching wait and consume.\\
 \hline
 \end{tabular}
 \end{table}
@@ -491,9 +636,10 @@ A separate Python validator parses selected upstream tutorial files using the st
 The formal artifact is a Lake project pinned to Lean 4.19.0. Building the
 project with \texttt{lake build} checks the core, transition semantics, and
 examples together. The source audit is run with Python 3 and an explicit local
-source root; the unambiguous command used for the audited checkout is
+source root; with the upstream checkout at \texttt{Triton-distributed-ascend}
+relative to the artifact root, the command is
 \texttt{python3 validation/validate\_source\_patterns.py --source-root
-/home/baber/baberrehman/Triton-distributed-ascend --mutate}. The unmutated
+Triton-distributed-ascend --mutate}. The unmutated
 checks report 15 passes, and the mutation mode verifies that selected deletions
 are rejected. The validator uses only the Python standard library.
 
