@@ -1,0 +1,622 @@
+\documentclass[a4paper,USenglish]{lipics-v2021}
+\bibliographystyle{plainurl}
+
+\begin{document}
+
+\title{A Provenance-Aware Core Calculus for Triton-Distributed Synchronization}
+\titlerunning{A Core Calculus for Triton-Distributed Synchronization}
+
+\author{Anonymous}{Anonymous Institution}{}{}{}
+\authorrunning{Anonymous}
+\Copyright{Anonymous}
+\ccsdesc[500]{Software and its engineering~Formal software verification}
+\ccsdesc[300]{Software and its engineering~Concurrency}
+\keywords{Lean, distributed accelerators, synchronization, provenance, operational semantics}
+\relatedversion{}
+\supplement{Lean formalization and validation sources in the accompanying artifact}
+
+\maketitle
+
+\begin{abstract}
+Triton-Distributed exposes signal-based synchronization operations intended to order communication and computation in distributed accelerator kernels. Reasoning about the intended wait--token--load discipline is difficult because the Python API, compiler IR, and backend memory model provide different parts of the contract. We present a mechanized core calculus that isolates one such discipline and makes its obligations explicit. The Lean 4 model includes typed values and environments, notification state, successful waits, token consumption, and guarded loads. Its transition semantics associates pending and consumed capabilities with signal, rank, pointer, scope, and ordering metadata. We prove preservation of capability origins across traces and a universal provenance theorem: from an initial state with no pending or consumed capabilities, every permitted load has an earlier matching wait and consume in the abstract action trace. We also mechanize a three-step producer--consumer trace and negative examples that exclude loads without the required abstract capabilities. A source-pattern validator checks three representative upstream tutorial shapes against a pinned Triton-distributed checkout. These results establish properties of the encoded calculus and checked source patterns only. They do not establish a source-to-core simulation, compiler correctness, backend memory-model refinement, or hardware safety. We describe the abstraction boundary and identify the additional translation, compiler, and target evidence needed to support stronger claims.
+\end{abstract}
+
+\section{Introduction}
+Distributed accelerator kernels combine communication with computation and rely on synchronization operations whose effects cross API, compiler, and hardware layers. Triton-Distributed provides operations including \texttt{notify}, \texttt{wait}, and \texttt{consume\_token}; in the documented producer--consumer idiom, a consumer waits for a signal, consumes the resulting token with the data value, and then loads the value. The intended ordering is not captured by the type of an ordinary load alone. It depends on a protocol among signal state, token use, compiler dependency preservation, and target memory visibility.
+
+This paper develops a small Lean 4 calculus for studying one precise question: what trace-level evidence is required before a load is permitted by an abstract wait--consume discipline? The calculus is intentionally small. It makes notification and capability state explicit, records the metadata used to match a wait to a later consume and load, and supports machine-checked statements about the resulting transition traces.
+
+Our primary result is a provenance theorem. For any trace beginning with empty pending-token and consumed-ordering lists, if its final machine admits a load of a typed symmetric pointer, then the action list can be decomposed to exhibit an earlier wait and a subsequent consume for that pointer, with matching rank and signal address. This theorem is stronger than the checked example alone: it quantifies over arbitrary traces admitted by the transition relation. Its meaning is nevertheless confined to that relation. In particular, it is not a theorem that arbitrary Triton source, compiler IR, generated instructions, or executions on an accelerator satisfy the relation.
+
+\paragraph{Contributions.}
+\begin{itemize}
+  \item We define a typed Lean core with notification, wait, consume, and load transitions, and state the notification-visibility condition as an explicit semantic premise.
+  \item We prove that pending and consumed capabilities retain trace origins, and derive a universal wait--consume provenance decomposition for permitted loads from empty capability state.
+  \item We provide executable positive and negative protocol examples, together with a standard-library Python AST validator for selected upstream tutorial call shapes.
+  \item We document the source correspondence and trusted boundary, including the missing source translation, dependency-preservation proof, and backend memory-model refinement.
+\end{itemize}
+
+These contributions should be read as a source-audited formal prototype, not as verification of Triton-Distributed or a claim of priority. Our related-work discussion is focused rather than systematic, and the results do not establish novelty relative to all prior work.
+
+\paragraph{Roadmap and notation.}
+Section~2 records the source contract and abstraction boundary. Section~3
+defines the Lean vocabulary, expression evaluator, and transition rules;
+subsections follow the order of the declarations in \texttt{Core.lean} and
+\texttt{Transition.lean}. Section~4 states the mechanized invariants and gives
+proof decompositions. Section~5 presents concrete traces and source-pattern
+validation. Section~6 compares the calculus with the implementation, while
+Section~7 lists assumptions and limitations. We write \(x\in L\) for list
+membership, \(L_1++L_2\) for list concatenation, and \(m\xrightarrow{a}m'\)
+for an enabled transition labelled by action \(a\). Lean identifiers are set
+in typewriter font when the exact declaration is relevant.
+
+\section{Background and Source Contract}
+Triton-Distributed's documented API includes rank queries, symmetric addressing, signal notification, waiting, and token consumption. The audited source revision begins with \texttt{1e6d6881} (2026-08-24); its full identifier is recorded in the data-availability statement. We use its Python API, distributed operation definitions, language documentation, semantics documentation, and notify--wait tutorial as evidence for the source-level operation shapes.
+
+The source API describes \texttt{wait} as returning an integer token and \texttt{consume\_token(value, token)} as introducing a dependency associated with a later use of \texttt{value}. In the tutorial idiom, the consumer waits, consumes the token with a data value, and loads the value. This motivates modeling a capability discipline. The API description does not itself prove that arbitrary source tokens have valid provenance, that a token corresponds to a particular data pointer, or that compiler transformations and target hardware preserve the intended ordering.
+
+\section{Core Calculus}
+This section gives the model in enough detail to reconstruct its definitions and
+to understand exactly what the proved theorems quantify over. The development
+is split into two Lean modules. \texttt{Core.lean} defines expressions,
+values, states, typing, and big-step evaluation. \texttt{Transition.lean}
+extends this vocabulary with explicit state transitions, capabilities, traces,
+and provenance theorems. \texttt{Examples.lean} constructs concrete traces and
+counterexamples over the transition semantics.
+
+The model has three design goals. First, symmetric addressing and loads should
+preserve pointer element types. Second, successful synchronization should leave
+an explicit capability that can be matched against a later data access. Third,
+that capability should have a trace origin, so an unrelated integer token
+cannot justify a load. Variables, ranks, and addresses are natural numbers;
+the environment is a function from variables to optional values. This keeps
+the artifact focused on the protocol rather than on parser, substitution, or
+thread-scheduling machinery.
+
+The model separates expression evaluation from protocol transitions. The
+expression relation describes the result of one operation in a fixed state;
+the transition relation evolves signals and capability state across actions.
+This separation permits ordinary type preservation to be stated independently
+from token provenance: a token can have the scalar token type without yet
+having a valid wait origin.
+
+\subsection{Machine state}
+A machine contains a state, a typed environment, a list of ordering witnesses, a list of pending tokens, and a list of consumed orderings. Values include typed symmetric pointers and tokens carrying address, observed value, scope, and ordering metadata. A pending token records its token variable, signal rank and address, expected signal value, scope, and ordering. A consumed ordering records the value and token variables, signal address, and rank.
+
+\subsubsection{Primitive domains}
+The model defines four data types, represented by the Lean inductive types
+\texttt{DType}, \texttt{Scope}, \texttt{Ordering}, and \texttt{Result}.
+The data types are \texttt{i32}, \texttt{i64}, \texttt{f16}, and
+\texttt{f32}. A type is a pair \(\langle d,n\rangle\), where \(d\) is a
+data type and \(n\) is a size. Scopes are \texttt{gpu} and \texttt{system};
+orderings are \texttt{relaxed}, \texttt{acquire}, \texttt{release}, and
+\texttt{acqRel}. Ranks, variables, and addresses are aliases for
+\texttt{Nat}.
+
+The explicit scope and ordering fields are retained even though the current
+provenance theorem does not model a weak-memory execution. A wait records
+these fields in its pending capability, and consume requires them to match.
+They are parameters of the future backend-refinement boundary: a target proof
+must explain what each pair means on the implementation platform.
+
+\subsubsection{Expressions and values}
+The expression grammar is the following rendering of the \texttt{Expr}
+inductive type:
+\[
+\begin{array}{rcl}
+ e & ::= & x \mid \mathsf{rank}(a) \mid \mathsf{numRanks}(a)
+     \mid \mathsf{symmAt}(e,r) \\[1mm]
+   &\mid& \mathsf{notify}(e,e,e,b,s)
+     \mid \mathsf{wait}(e,e,e,s,o) \\[1mm]
+   &\mid& \mathsf{consumeToken}(e,e)
+     \mid \mathsf{load}(e) \mid \mathsf{store}(e,e).
+\end{array}
+\]
+Here \(a\) is an integer axis parameter, \(r\) is a target rank, \(b\) is
+the Boolean choice between set and add notification, and \(s,o\) are scope
+and ordering. The grammar retains the source operation boundaries. In
+particular, \texttt{consumeToken} is not reduced to an ordinary identity
+expression, even though it returns its value operand; its protocol effect is
+represented in the transition layer.
+
+Runtime values include tiles, scalar integers, pointers, tokens, and unit:
+\[
+\begin{array}{rcl}
+ v & ::= & \mathsf{tile}(\tau,\vec z) \mid \mathsf{i32}(z)
+     \mid \mathsf{i64}(z) \\[1mm]
+   &\mid& \mathsf{ptr}(\tau,r,a,\mathsf{sym})
+     \mid \mathsf{token}(a,n,s,o) \mid \mathsf{unit}.
+\end{array}
+\]
+The pointer stores an element type, owner rank, address, and a symmetric bit.
+The token stores signal address, observed value, scope, and ordering. Its
+static type is still scalar \(\mathsf{i32}\); metadata is used by the abstract
+protocol. The environment \(\rho\) maps variables to optional values.
+
+The state is \(\sigma=(W,R,M,T,S,O)\), containing world size, current rank,
+memory, cell types, signals, and signal ownership. Memory maps a rank and
+address to an optional value; cell types map the same pair to an optional type.
+Signals map rank and address to natural counters. The separate memory and
+cell-type maps support a store well-typedness predicate without introducing a
+full typed heap semantics.
+
+\subsection{Static typing}
+The context \(\Gamma\) contains a world size and a variable-to-type map. The
+judgment \(\Gamma\vdash e:\tau\), implemented by \texttt{HasType}, has one
+constructor for each expression form. Variables use the type supplied by the
+context. Rank and world-size queries return scalar \(\mathsf{i32}\), while
+symmetric addressing preserves the operand type and requires a target below
+the context world size.
+
+The notification constructor requires an \(\mathsf{i64}\) scalar signal
+pointer, an \(\mathsf{i32}\) rank, and an \(\mathsf{i64}\) signal value; it
+returns unit. Wait has the same pointer, count, and expected-value shapes and
+returns an \(\mathsf{i32}\) token. Consume requires an arbitrary value type
+and an \(\mathsf{i32}\) token, returning the first operand's type. Loads
+preserve pointer type and stores return unit.
+
+Typing is intentionally permissive about provenance. A token is well typed
+because it has the token type; typing alone does not say that it came from a
+successful wait. The transition-level pending and consumed capabilities provide
+that stronger fact. Thus the main result is a protocol refinement of the
+ordinary type system, not a claim that the token type itself encodes lineage.
+
+\subsection{Value and store typing}
+The predicate \texttt{ValueHasType W v $\tau$} is defined by cases on the
+value. A tile has the declared type and a payload whose list length equals the
+type size. Integer values have exactly their scalar types. A pointer has the
+declared element type and an owner below \(W\). A token has scalar
+\(\mathsf{i32}\) type regardless of metadata, and unit has the zero-sized
+\(\mathsf{i32}\) type.
+
+The environment predicate is pointwise: whenever \(\Gamma\) assigns a type to
+a variable and the environment assigns a value, that value satisfies
+\texttt{ValueHasType}. The store predicate states that every in-range cell
+with a declared type and present memory value contains a value of that type.
+This makes load preservation direct: the load rule supplies the cell lookup,
+while \texttt{StoreWellTyped} supplies value typing.
+
+\subsection{Expression evaluation}
+The relation \(\sigma,\rho\vdash e\Downarrow r\), implemented by
+\texttt{Eval}, returns either \(\mathsf{value}(v)\) or \(\mathsf{blocked}\).
+Variable lookup returns the environment value. A rank query returns the current
+rank when it is in range, and a world-size query returns the state world.
+Symmetric addressing takes a symmetric pointer and a valid target and returns a
+pointer with the target rank while preserving element type and address.
+
+Notification evaluation checks for a symmetric \(\mathsf{i64}\) signal pointer
+and an in-range rank, returning unit; its signal update is represented by the
+transition semantics. A ready wait checks a pointer, positive count, expected
+value, and \texttt{NotificationVisible}; it returns a token carrying signal
+address, expected value, scope, and ordering. A blocked wait checks a positive
+count and a signal below the expected value and returns \texttt{blocked}.
+Consume checks matching value and token metadata and returns the value operand.
+The expression rule does not require that the token originated from a wait;
+that stronger condition belongs to \texttt{Step.consume}. Load checks a
+symmetric pointer, valid rank, matching cell type, and present memory value.
+
+\subsection{Expression-level metatheory}
+The core proves evaluation determinism:
+\[
+ \frac{\sigma,\rho\vdash e\Downarrow r_1 \qquad
+   \sigma,\rho\vdash e\Downarrow r_2}{r_1=r_2}.
+\]
+The Lean theorem \texttt{eval\_deterministic} proves this by inversion on
+the two evaluation derivations. \texttt{eval\_var\_preservation} proves
+that a well-typed variable lookup returns a value of its context type.
+Rank, wait, and symmetric-addressing preservation establish the corresponding
+scalar, token, and pointer results. \texttt{eval\_load\_preservation} uses
+\texttt{StoreWellTyped} to show that a successful load returns a value with
+the declared cell type.
+
+These are local theorems for a fixed state and environment. They do not imply
+determinism of a distributed execution, and they do not establish the
+capability invariant. That invariant is proved over the transition trace.
+
+Signal updates are state-changing transitions. A set notification assigns a signal value; an add notification increments it. A wait transition is enabled when the expected value is no greater than the current signal value and the explicit predicate \texttt{NotificationVisible} holds. A successful wait adds a witness and a pending-token capability. The predicate is a premise: it is not derived from a hardware memory model.
+
+A consume transition requires a well-typed symmetric pointer and token in the environment, matching token and pointer addresses, and a pending capability whose token variable, signal rank, signal address, scope, and ordering match. It removes pending capabilities for that token variable and records a consumed ordering. A load transition is permitted only when the environment contains a symmetric pointer and a matching consumed ordering exists for the pointer variable, rank, and address.
+
+\subsection{Trace semantics}
+A trace is a list-indexed inductive relation generated by single-step transitions. The semantics distinguishes an action sequence from a mere collection of state facts, allowing provenance to be stated over the complete trace. The calculus models no state-changing data-store transition. It represents notification state and abstract data-pointer metadata in a simplified address namespace.
+
+\subsection{Operational rule schemas}
+For clarity, this subsection presents the principal transition constructors in
+rule form. The notation is descriptive of the Lean constructors; it is not a
+second semantics. Let \(m=(\sigma,\rho,Wit,Pen,Con)\) be a machine, where
+\(Wit\), \(Pen\), and \(Con\) are the witness, pending, and consumed lists.
+The notification rules are:
+\[
+\frac{r<W \qquad \mathsf{ptr}(\mathsf{i64},r,a,\mathsf{true})\in\rho
+  \qquad b=\mathsf{set}}
+     {m\xrightarrow{\mathsf{notifySet}(r,a,v,s)}
+  m[\sigma.S(r,a):=v]}
+\]
+and
+\[
+\frac{r<W \qquad \mathsf{ptr}(\mathsf{i64},r,a,\mathsf{true})\in\rho
+  \qquad b=\mathsf{add}}
+     {m\xrightarrow{\mathsf{notifyAdd}(r,a,v,s)}
+  m[\sigma.S(r,a):=\sigma.S(r,a)+v]}.
+\]
+The source-level distinction between a set and an add is retained in the
+action constructor, because replacing one by the other changes the signal
+history even when the final counter happens to coincide.
+
+The wait rule is:
+\[
+\frac{n>0 \qquad n\leq S(r,a) \qquad
+  \mathsf{NotificationVisible}(\sigma,r,a,s)}
+     {m\xrightarrow{\mathsf{wait}(r,a,n,t,s,o)}
+  m[Wit:=w::Wit,\ Pen:=p::Pen]}.
+\]
+Here \(w=(r,a,n,s,o)\) and \(p=(t,r,a,n,s,o)\). The rule records both the
+ordering witness and the token variable. The two records serve different
+purposes: the witness represents the successful synchronization event, while
+the pending record is the resource that a later consume must spend.
+
+The consume rule can be written as:
+\[
+\frac{\rho(x)=\mathsf{ptr}(\tau,r,a,\mathsf{true}) \quad
+  \rho(t)=\mathsf{token}(a,n,s,o) \quad
+  (t,r,a,n,s,o)\in Pen}
+     {m\xrightarrow{\mathsf{consume}(x,t)}
+  m[Pen:=\mathsf{filter}_{t}(Pen),\ Con:=c(x,t,a,r)::Con]}.
+\]
+The notation \(\mathsf{filter}_{t}\) denotes the list operation used by the
+Lean definition to remove pending records for the consumed token variable.
+The premise contains more information than the consumed record stores: the
+expected value, scope, and ordering are needed to validate the token, whereas
+the later load needs only the pointer-to-signal association represented by
+\(c\). This asymmetry is a conscious abstraction and is discussed in the
+limitations section.
+
+Finally, load is a permission transition:
+\[
+\frac{\rho(x)=\mathsf{ptr}(\tau,r,a,\mathsf{true}) \quad
+  c(x,t,a,r)\in Con}
+     {m\xrightarrow{\mathsf{load}(x)}m}.
+\]
+The rule is a self-loop because the expression evaluator, rather than the
+transition relation, returns the memory value. The self-loop still matters:
+it permits the theorem to quantify over a final action and to infer its
+history from the consumed capability required by the premise.
+
+\subsection{Capability records and ownership}
+There are three related notions of identity in the model. A signal location is
+identified by rank and address. A token is identified by its environment
+variable and runtime metadata. A consumed ordering is identified by the value
+variable, token variable, signal address, and rank. These identities should not
+be conflated. For example, two token variables may contain equal runtime
+tokens, while only one may have a pending capability in the machine.
+
+The ownership map is used by \texttt{NotificationVisible}. Its role is to
+prevent a malformed signal location from being treated as a visible event: the
+owner must be below the world size. It does not encode a distributed ownership
+protocol, and it does not require the current rank to equal the owner. Thus the
+model can express a remote signal observation while retaining a basic
+well-formedness check.
+
+The world size occurs in several premises rather than in one global invariant.
+Pointer values require their owner to be in range; symmetric addressing
+requires its target to be in range; notification transitions require the
+signal rank to be in range; and visibility requires the signal owner to be in
+range. This repetition is useful in the Lean proofs because each constructor
+exposes the exact arithmetic fact it needs. It also identifies a future
+refactoring opportunity: a dependent location type could package these bounds,
+but would make the current examples and theorem statements less direct.
+
+\subsection{Invariant decomposition}
+The main safety argument is the conjunction of four smaller facts. First,
+\emph{world preservation} says that transitions do not change the state's
+world size. Second, \emph{environment preservation} says that the transition
+rules inspect but do not mutate the environment. Third, \emph{capability
+origin preservation} says that every pending and consumed record has a history
+origin. Fourth, \emph{load admissibility} says that a load can occur only when
+its pointer has a matching consumed record.
+
+The first two facts support ordinary typing and are independent of the wait
+protocol. The third fact is generated by wait and consume. The fourth fact is
+the final interface between the protocol and data access. Separating them
+prevents a common proof error: using a well-typed pointer as if it already
+carried synchronization permission. In this calculus, pointer typing proves
+shape and rank bounds; consumed capability proves history.
+
+The decomposition also explains why the initial-state hypothesis matters. If
+the initial machine were allowed to contain arbitrary pending or consumed
+records, the origin theorem would need an explicit origin history for those
+records. The universal load theorem instead assumes both lists are empty, so
+all capabilities used by a load must have been generated by the trace itself.
+
+\subsection{Blocked evaluation versus absent transitions}
+The expression relation includes \texttt{blocked} as a result because a wait
+may be evaluated before its signal reaches the expected value. A blocked result
+is not a transition: it does not add a witness, does not add a pending token,
+and does not advance a machine trace. This distinction is reflected in the
+Lean development by separate constructors for \texttt{waitBlocked} and the
+successful wait transition.
+
+The distinction is particularly important for progress claims. From a blocked
+evaluation one can conclude that the observed signal is below the expected
+value, but one cannot conclude that the signal will eventually increase. From
+a successful evaluation one can extract visibility and a token, but one cannot
+conclude that a consumer will execute consume. The artifact therefore proves a
+conditional local progress characterization rather than a liveness theorem.
+
+\subsection{Relationship between expression and transition premises}
+Expression evaluation and transition execution share the state and environment
+vocabulary but are not definitionally identical. A successful expression wait
+contains enough information to construct the token returned to the caller. The
+transition wait additionally records that success in the machine's capability
+lists. Similarly, expression-level consume checks runtime token metadata,
+whereas transition-level consume checks pending provenance.
+
+This two-level design permits negative examples that are useful for auditing.
+An environment can contain a correctly shaped token and therefore satisfy the
+expression consume rule, while no transition consume is possible because the
+pending list is empty. Conversely, a pending capability alone is insufficient
+for consume if the environment token or pointer metadata does not match. The
+formalization thus distinguishes shape errors, readiness errors, and provenance
+errors rather than collapsing them into one failure result.
+
+\section{Mechanized Results}
+The results are organized into three layers. Core-level lemmas reason about
+values produced by one expression. Step-level lemmas reason about the shape of
+one enabled action. Trace-level lemmas lift the step facts to arbitrary finite
+executions. This organization mirrors the Lean files and avoids hiding a
+transition premise inside an informal operational argument.
+
+\subsection{Theorem contracts}
+Table~\ref{tab:theorems} summarizes the principal theorem contracts. A theorem
+whose conclusion mentions typing concerns only the encoded types and values;
+a theorem mentioning origins concerns the explicit lists in \texttt{Machine}.
+In particular, the table makes visible that provenance and memory visibility
+are different obligations.
+\begin{table}[t]
+\centering
+\caption{Selected theorem contracts in the Lean artifact.}
+\label{tab:theorems}
+\small
+\begin{tabular}{p{.25\linewidth}p{.66\linewidth}}
+\hline
+Theorem & Contract \\
+\hline
+\texttt{eval\_deterministic} & One expression has one result in a fixed state and environment.\\
+\texttt{eval\_var\_preservation} & A typed variable returns a value of the context type.\\
+\texttt{eval\_wait\_preservation} & A successful wait returns a scalar token.\\
+\texttt{eval\_symmAt\_safe} & Symmetric addressing preserves type and bounds.\\
+\texttt{eval\_load\_preservation} & A successful load is covered by store typing.\\
+\texttt{wait\_success\_has\_visible\_notification} & A successful wait exposes visibility.\\
+\texttt{notify\_set/add\_preserves\_signals} & Notification changes only its signal cell.\\
+\texttt{wait\_step\_adds\_witness} & Wait adds a witness and pending token.\\
+\texttt{consume\_requires\_wait\_token} & Consume has a matching pending capability.\\
+\texttt{load\_requires\_ordering\_witness} & Load has a matching consumed ordering.\\
+\texttt{trace\_preserves\_capability\_origins} & Capabilities have wait/consume origins.\\
+\texttt{load\_has\_prior\_wait\_and\_consume} & A permitted load follows matching wait and consume.\\
+\hline
+\end{tabular}
+\end{table}
+
+\subsection{Capability-origin invariant}
+The theorem \texttt{trace\_preserves\_capability\_origins} states that if each pending and consumed capability in the initial machine has an origin in a history prefix, then after any admitted trace, every resulting capability has a corresponding origin in the concatenated history. A pending token's origin is a matching wait action. A consumed ordering's origin is a wait followed later by a matching consume.
+
+The proof proceeds by induction on the trace derivation. Notification and load steps preserve the capability lists. A wait introduces one pending capability whose origin is the current action. A consume removes matching pending entries and introduces one consumed capability; the transition premise supplies the pending token whose wait origin extends to a wait--consume decomposition. Existing origins are extended by appending the current action.
+
+\subsection{Universal load provenance}
+The central theorem, \texttt{load\_has\_prior\_wait\_and\_consume}, assumes empty initial pending and consumed lists, a trace to a final machine, and a permitted load step from that machine. It concludes that there exist lists \(before\), \(middle\), and \(after\), along with matching metadata, such that
+\[
+ actions = before \, ++ \, [wait] \, ++ \, middle \, ++ \, [consume] \, ++ \, after,
+\]
+and the loaded environment variable has the corresponding typed symmetric pointer. Thus the result rules out, within the calculus, a permitted load lacking a preceding wait and consume in the trace.
+
+The theorem does not show that the wait made real memory visible or that the compiler retained an SSA dependency. The consume transition's capability is an abstract machine invariant. The theorem also does not establish program termination or guarantee that a wait eventually succeeds.
+
+\subsection{Type and progress results}
+The core includes preservation statements for typed environments and stores across modeled steps and traces, along with conditional wait progress. The latter says that, under the visibility premise, either the wait transition is enabled or the observed signal is below the expected value. This is a local characterization of the modeled wait; it is not deadlock freedom, fairness, or collective progress.
+
+\subsection{Proof structure and induction measures}
+The expression lemmas use inversion on the relevant \texttt{Eval} constructor.
+For example, inversion on a successful symmetric-addressing derivation exposes
+the pointer lookup and target-bound premise, so the conclusion follows by the
+definition of \texttt{ValueHasType}. The store lemma is similarly a direct
+application of the quantified premise in \texttt{StoreWellTyped}.
+
+The transition lemmas use the concrete list operations in the machine. A wait
+step prepends one pending record and one witness; a consume step filters the
+pending list and prepends one consumed record. The key proof obligation is
+therefore not list membership alone but preservation of the metadata relation
+between the environment and the capability record. The implementation proves
+this by destructing the matching pending record supplied by the consume rule.
+
+The trace theorems use induction on the derivation rather than induction on an
+untrusted action list. The empty case establishes the initial capability
+origin assumption. In the step case, the induction hypothesis handles all
+pre-existing capabilities, while the action-specific lemma handles the one
+new capability introduced by wait or consume. The load theorem then applies
+the origin invariant to the consumed record required by the final load step
+and decomposes the action list into prefix, wait, middle, consume, and suffix.
+
+This proof architecture is intentionally auditable. It makes the source of
+each premise visible in Lean and prevents a theorem about arbitrary lists from
+being mistaken for a theorem about enabled executions.
+
+\section{Examples and Source Validation}
+The Lean examples construct a producer state with a signal value and a consumer trace of \texttt{wait -> consume -> load}, starting with empty capability lists. Negative results show that a load is not derivable from a machine lacking a consumed capability, and that an environment token alone cannot authorize consume when no pending wait capability exists. These examples demonstrate the transition rules, while the universal theorem supplies the general trace property.
+
+\subsection{Concrete positive trace}
+The positive example uses a two-rank world. The consumer is rank zero, the
+signal address is three, and the data address is seven. The signal owner is
+rank zero and its counter is initialized to one. The environment contains a
+symmetric \(\mathsf{i32}\) pointer at variable one, a token variable two, and
+the corresponding signal pointer and scalar arguments used by the wait. The
+initial pending and consumed lists are empty.
+
+The first action is a wait for expected value one. Its enabledness follows
+from \(1\leq S(0,3)\) and \texttt{NotificationVisible}. The resulting machine
+contains a pending record connecting token variable two to rank zero and
+signal address three. The second action consumes variable one with token two.
+The address and scope/order fields agree with the pending record, so the
+pending record is removed and \texttt{ConsumedOrdering} records the pointer
+variable, token variable, signal address, and rank. The third action loads
+variable one. It is enabled because the consumed record matches the pointer's
+rank and data address. This is the concrete witness used by the universal load
+theorem.
+
+\subsection{Negative traces and blocked waits}
+The first negative example starts with the same environment but an empty
+consumed list and attempts a load. The load premise cannot be constructed,
+because \texttt{load} requires a matching consumed ordering. The second starts
+with a token value in the environment but no pending wait capability. Although
+the token is well typed and expression-level consume can return its value, the
+transition-level consume premise fails. This illustrates why the scalar token
+type is weaker than provenance.
+
+A third classification sets the signal below the expected value. The
+expression evaluator derives \texttt{waitBlocked}, and no successful wait
+transition is available. This is not a safety violation: the model distinguishes
+absence of readiness from an invalid token or an unauthorized load. The
+conditional progress theorem captures exactly this distinction.
+
+\subsection{What the examples do not test}
+The examples are proof-producing unit cases, not distributed executions. They
+do not test network latency, multiple concurrent producers, signal reuse across
+epochs, allocation failures, compiler scheduling, or device memory behavior.
+They also do not establish that the source tutorial necessarily lowers to the
+same action sequence. Their role is to make the abstract premises and the
+counterfactual failures executable at the Lean level.
+
+A separate Python validator parses selected upstream tutorial files using the standard-library AST module. It checks three source patterns: a notify/wait producer--consumer example, an intra-node all-gather, and an overlapping all-gather/GEMM example. Mutation checks reject selected in-memory source alterations, including removal of token consumption or signal-bearing communication. This validator checks names and relative source-call shapes. It is not an execution test, a translation validator, or evidence about generated IR or hardware behavior.
+
+\subsection{Artifact and reproducibility}
+The formal artifact is a Lake project pinned to Lean 4.19.0. Building the
+project with \texttt{lake build} checks the core, transition semantics, and
+examples together. The source audit is run with Python 3 and an explicit local
+source root; the unambiguous command used for the audited checkout is
+\texttt{python3 validation/validate\_source\_patterns.py --source-root
+/home/baber/baberrehman/Triton-distributed-ascend --mutate}. The unmutated
+checks report 15 passes, and the mutation mode verifies that selected deletions
+are rejected. The validator uses only the Python standard library.
+
+The Lean source contains no \texttt{sorry}, \texttt{admit}, or user-declared
+\texttt{axiom}. This statement concerns the checked artifact, not the
+assumptions encoded as propositions such as \texttt{NotificationVisible}.
+Those assumptions are ordinary theorem premises and are deliberately exposed
+in theorem statements. The paper's PDF is built using the official
+\texttt{lipics-v2021} class and the \texttt{plainurl} bibliography style.
+
+\section{Relationship to the Implementation}
+\subsection{Correspondence obligations}
+The relationship between the source API and the calculus can be stated as a
+sequence of obligations. The first is syntactic: a source call must have the
+argument shape recognized by the audit. The second is typing: translated
+expressions must inhabit the corresponding \texttt{HasType} judgments. The
+third is enabling: the source execution must supply the signal and visibility
+premises required by a transition. The fourth is provenance: the token
+consumed by a data value must be the token generated by the matching wait. The
+fifth is refinement: source and target executions must agree on visibility and
+dependency preservation.
+
+Only the middle part of this chain is present here. Lean defines what counts
+as a typed and enabled core execution, while the Python validator checks a
+small set of source shapes. There is no function from Python ASTs, Triton IR,
+or MLIR values to \texttt{Expr} values. In particular, a validator success
+does not construct an \texttt{Env}, \texttt{Ctx}, or \texttt{Machine} and
+cannot be used as a premise of a Lean theorem without an additional
+translation proof.
+
+An eventual translation would need to specify how source objects become
+abstract addresses and variables. It would also need to state whether a
+source token is linear, affine, or freely copyable. The current model records
+pending capability consumption but does not encode uniqueness of a runtime
+token in the environment. A source-level proof could enforce linear use or
+prove that duplicated token values cannot create an additional consumed
+ordering. This is a design choice rather than an implementation detail.
+
+\subsection{Compiler transformations}
+The abstract consume action represents a dependency edge between communication
+completion and a later data use. A compiler may preserve that edge by keeping
+a data dependency, attaching an ordering attribute, or lowering to a backend
+primitive with an equivalent effect. The calculus does not distinguish these
+strategies. It records the edge as a capability and proves that a load is
+guarded by it.
+
+This abstraction does not prove optimizer preservation. Common-subexpression
+elimination could duplicate or merge token-producing expressions; dead-code
+elimination could remove a consume whose result appears unused; scheduling
+could move a load before communication; and lowering could erase scope or
+ordering metadata. A compiler correctness theorem would need an observation
+relation that treats the capability edge as semantically relevant. It would
+then show that every target load corresponding to a source load has a source
+wait and consume, or that a target primitive provides an equivalent guarantee.
+
+The action-list theorem also does not assume syntactic adjacency. It permits
+arbitrary actions in the middle list \(middle\), so computation, independent
+notifications, and other overlap can occur between synchronization steps. The
+required fact is the existence and order of the capability edge, not that the
+three operations are consecutive.
+
+\subsection{Signal reuse and epochs}
+Signals are natural-number counters, and waits compare an expected value with
+the current counter. This supports monotone protocols such as waiting for one
+and later two, but it does not establish that a value belongs to the intended
+communication epoch. If a signal address is reused, an old value may satisfy a
+later wait unless allocation and epoch discipline are supplied externally.
+
+The witness list records the expected value and can distinguish waits for
+different counter values. The consumed ordering currently stores only the
+pointer variable, token variable, signal address, and rank. It does not retain
+the expected value. Consequently, the load theorem proves a matching
+wait/consume history for the recorded association, but not a global theorem
+that a load observes the newest producer epoch. Adding expected value and
+scope/order fields to the consumed record would support that strengthening.
+
+\subsection{Alternative modeling choices}
+One alternative would encode protocol state in dependent types. A token type
+could carry its signal address and expected value, and consume could require a
+proof that the token was produced by wait. This would make invalid consume
+expressions unrepresentable, but would move the central result from trace
+reasoning into type formation. The present model keeps tokens scalar-typed and
+proves provenance as an invariant over enabled transitions, matching the fact
+that compiler IR values often carry less static information than a protocol
+requires.
+
+A second alternative would model complete configurations with control-flow
+locations and multiple ranks. That would support interleaving and scheduling
+theorems, but would add machinery not needed for the local wait--consume--load
+property. The current machine represents one abstract protocol history and
+leaves interleaving to the supplied trace. A third alternative would expand
+\texttt{NotificationVisible} into a weak-memory model. Keeping it as an
+interface lets a backend-specific happens-before or message-passing relation
+replace the predicate while preserving the provenance proof's structure.
+
+The model is informed by source operation signatures but abstracts several API dimensions. Rank and world-size queries are represented at a high level; pointer/count evaluation for waits is abstracted; the wait is represented by a scalar rank/address/expected-value tuple; and arbitrary SSA token dataflow is not modeled. The source operation \texttt{consume\_token} accepts a value and token independently, while the calculus adds explicit matching premises. Ordinary loads are guarded by a capability in the calculus, whereas the Python-level load API does not generally reject a load lacking such a consume dependency.
+
+Accordingly, the relation is a deliberate strengthening and abstraction for proof tractability, not an equivalence. The implementation may express programs not admitted by the calculus. Conversely, the calculus has no translation theorem proving that the source programs accepted by the validator map to its actions. Potential mismatch cases include unrelated tokens, signal/data pointer mismatch, omitted consume, unsafe signal reuse, rank or allocation disagreement, and insufficient memory visibility. These are identified as obligations and possible failure modes, not as experimentally confirmed bugs in a particular kernel.
+
+\section{Assumptions and Limitations}
+The results rely on explicit premises and omitted mechanisms:
+\begin{itemize}
+  \item \texttt{NotificationVisible} is assumed for successful waits; no CANN, CUDA, NVSHMEM, or ROCSHMEM rule is proved.
+  \item Compiler preservation of the consume dependency through optimization and lowering is not established.
+  \item Symmetric allocation agreement, signal initialization and epoch discipline, and valid collective participation are not modeled as global invariants.
+  \item The model has no source/MLIR-to-core translation or simulation, no backend refinement, and no hardware execution semantics.
+  \item The core does not prove deadlock freedom, fairness, buffer lifetime, general data-race freedom, or end-to-end kernel correctness.
+\end{itemize}
+
+A stronger result would require a typed source or IR subset, a translation into the core, a simulation theorem, and evidence or a formal refinement connecting visibility and dependency preservation to each supported backend. Targeted litmus tests and signal-reuse tests would complement, but not replace, those proofs.
+
+\section{Related Work}
+Triton-Distributed and TileLink study programming and optimization techniques for overlapping communication and computation on distributed accelerators \cite{zheng2025tritondistributed,zheng2025tilelink}. Our work does not reproduce their compiler or performance evaluations; it isolates a small synchronization protocol for mechanized trace reasoning.
+
+Concurrent separation logics such as Iris provide general reasoning principles for higher-order concurrency \cite{jung2018iris,timany2024logical}. Aneris and Trillium address distributed reasoning and intensional refinement \cite{krogh2020aneris,timany2024trillium}, while Actris integrates session-typed protocols with separation logic \cite{hinrichsen2020actris}. These frameworks have substantially broader logical foundations than the present transition system; our development does not encode them.
+
+Weak-memory logics and executable memory models emphasize that ordering and visibility must be justified by a target semantics \cite{kaiser2017strong,alglave2010fences}. Kami demonstrates mechanized hardware specification and refinement \cite{chlipala2017kami}. GPUVerify targets GPU-kernel race and barrier-divergence properties, while CompCert proves semantic preservation for a defined compiler pipeline \cite{rival2012gpuverify,leroy2009compcert}. The present work supplies none of those end-to-end guarantees. The comparison is focused and does not support a novelty or priority claim.
+
+\section{Conclusion}
+We presented a Lean core calculus for a wait--consume--load synchronization discipline motivated by Triton-Distributed. The mechanized provenance invariant and universal load theorem show that the transition system itself requires a matching earlier wait and consume before it permits a load. A source-pattern audit checks selected examples and exposes, rather than closes, the gap between source operations and the abstract calculus. The immediate technical value is a precise statement of the obligations a future source-to-core and backend-refinement account must discharge. Establishing such a connection, and validating target-specific memory-ordering assumptions, remains future work.
+
+\paragraph{Data Availability.} The Lean source, validation script, source audit, and build instructions are available in the anonymous supplementary artifact associated with this submission. The artifact is built with Lean 4.19.0 and Lake; source-pattern validation uses Python 3 and the standard library. During double-blind review, identifying repository URLs are omitted. The audited upstream revision is recorded as \texttt{1e6d6881cddf645759aa250c94b4157355aa57dc}.
+
+\bibliography{references}
+
+\end{document}
