@@ -4,7 +4,7 @@
 
 This report compares the Lean core calculus in this directory with the implementation in:
 
-- `/home/baber/baberrehman/Triton-distributed-ascend`
+- `Triton-distributed-ascend`
 - audited source revision: `1e6d6881cddf645759aa250c94b4157355aa57dc`
 
 The Lean model is **stricter than the implementation interface** for the specific capability discipline it formalizes. A permitted `Action.load` must be preceded, in the modeled machine state, by a matching consumed capability. A consumed capability must have matching pointer, token, rank, address, scope, and ordering metadata, and must originate from a pending capability created by a successful `wait`. Consequently, `load_has_prior_wait_and_consume` proves that every permitted load from empty initial capability lists has an earlier matching `wait` and `consume` in the abstract trace.
