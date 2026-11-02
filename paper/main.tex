@@ -1,14 +1,22 @@
 \documentclass[a4paper,USenglish]{lipics-v2021}
 \bibliographystyle{plainurl}
 
+\makeatletter
+\renewcommand\paragraph{\@startsection{paragraph}{4}{\z@}%
+  {-3.25ex \@plus -1ex \@minus -.2ex}%
+  {-1em}%
+  {\sffamily\large\bfseries\raggedright}}
+\setcounter{secnumdepth}{3}
+\makeatother
+
 \begin{document}
 
 \title{A Provenance-Aware Core Calculus for Triton-Distributed Synchronization}
 \titlerunning{A Core Calculus for Triton-Distributed Synchronization}
 
-\author{Anonymous}{Anonymous Institution}{}{}{}
-\authorrunning{Anonymous}
-\Copyright{Anonymous}
+\author{Baber Rehman}{Huawei Technologies, Hong Kong}{brehman@connect.hku.hk}{}{}
+\authorrunning{Baber Rehman}
+\Copyright{Baber Rehman}
 \ccsdesc[500]{Software and its engineering~Formal software verification}
 \ccsdesc[300]{Software and its engineering~Concurrency}
 \keywords{Lean, distributed accelerators, synchronization, provenance, operational semantics}
@@ -22,11 +30,23 @@ Triton-Distributed exposes signal-based synchronization operations intended to o
 \end{abstract}
 
 \section{Introduction}
-Distributed accelerator kernels combine communication with computation and rely on synchronization operations whose effects cross API, compiler, and hardware layers. Triton-Distributed provides operations including \texttt{notify}, \texttt{wait}, and \texttt{consume\_token}; in the documented producer--consumer idiom, a consumer waits for a signal, consumes the resulting token with the data value, and then loads the value. The intended ordering is not captured by the type of an ordinary load alone. It depends on a protocol among signal state, token use, compiler dependency preservation, and target memory visibility.
+Distributed accelerators make communication part of the computation: while one rank produces data, another may need to wait for a signal, establish a dependency on the data, and only then load it. Getting this order wrong can leave a kernel with values that are stale or otherwise not justified by the intended communication protocol. Yet the relevant contract is distributed across layers. An API can describe the shape of \texttt{notify}, \texttt{wait}, and \texttt{consume\_token}; an intermediate representation can encode dependencies; compiler transformations can preserve or alter those dependencies; and a backend must map the operations to target-specific ordering and visibility. A source-level sequence that looks right is not, by itself, evidence that all these layers agree.
 
-This paper develops a small Lean 4 calculus for studying one precise question: what trace-level evidence is required before a load is permitted by an abstract wait--consume discipline? The calculus is intentionally small. It makes notification and capability state explicit, records the metadata used to match a wait to a later consume and load, and supports machine-checked statements about the resulting transition traces.
+This creates a verification gap with a deceptively simple symptom: an ordinary load can be well typed and still lack a valid synchronization history. Scalar and pointer types tell us what a value represents, but not whether the consumer has waited for the matching signal, whether the resulting token was consumed for this data value, or whether the load is covered by that consumption. Conversely, proving that a particular example follows the expected sequence does not establish that every load admitted by a semantics has the required history. A useful first step is therefore to make the protocol obligation precise at the level where it can be stated and checked: the transition trace.
 
-Our primary result is a provenance theorem. For any trace beginning with empty pending-token and consumed-ordering lists, if its final machine admits a load of a typed symmetric pointer, then the action list can be decomposed to exhibit an earlier wait and a subsequent consume for that pointer, with matching rank and signal address. This theorem is stronger than the checked example alone: it quantifies over arbitrary traces admitted by the transition relation. Its meaning is nevertheless confined to that relation. In particular, it is not a theorem that arbitrary Triton source, compiler IR, generated instructions, or executions on an accelerator satisfy the relation.
+For example, a consumer might wait on signal \(s_A\) but associate the resulting token with data pointer \(p_B\):
+\begin{lstlisting}[language=Python]
+token = wait(signal_A, ...)
+data = consume_token(data_ptr_B, token)
+value = tl.load(data)
+\end{lstlisting}
+The API accepts the token and value as separate operands; it does not generally check that the signal waited on protects the data addressed by \texttt{data\_ptr\_B}. The formal transition relation rejects this mismatched protocol: its pending capability records the waited-on signal and rank, and consumption and loading must match the relevant pointer and capability metadata. This is an illustrative model-to-interface gap, not a report of an observed upstream kernel failure; whether a particular mismatch produces incorrect machine behavior depends on the source program and compiler/backend execution.
+
+We study that obligation in a small Lean 4 core calculus motivated by Triton-Distributed's documented producer--consumer idiom. The calculus separates expression typing and evaluation from machine transitions, and represents synchronization evidence explicitly. A successful wait creates a pending capability carrying signal, rank, scope, and ordering metadata; consuming a token for a data value turns that evidence into a consumed ordering; a load is admitted only when the machine contains matching evidence. Crucially, notification visibility is an explicit premise of successful waiting. The model does not silently derive a hardware fact that it has not formalized.
+
+The central result is a universal provenance theorem, not merely a checked execution: for every trace admitted by the transition relation from an initial machine with no pending or consumed capabilities, any permitted load has an earlier matching wait followed by a consume, with the relevant pointer, rank, and signal metadata aligned. The theorem rules out a class of internally inconsistent abstract executions and makes the required evidence inspectable in Lean. This gives a precise local invariant that can guide stronger verification: a future source-to-core translation could show that source dependencies create the modeled capabilities, and a backend refinement could show that generated operations preserve their ordering and visibility.
+
+That boundary is essential to the contribution. We do not prove that arbitrary Triton-Distributed programs translate into this calculus, that compiler passes preserve its protocol, or that any hardware backend satisfies the visibility premise. Nor do we claim deadlock freedom, general race freedom, or end-to-end kernel safety. We instead formalize one synchronization discipline, prove what follows from it, audit selected tutorial-shaped source patterns, and identify the missing links needed to connect the abstract result to executable kernels. This deliberately layered result turns an informal ordering expectation into a machine-checked obligation without confusing that obligation with its still-unproved implementation.
 
 \paragraph{Contributions.}
 \begin{itemize}
@@ -51,9 +71,19 @@ for an enabled transition labelled by action \(a\). Lean identifiers are set
 in typewriter font when the exact declaration is relevant.
 
 \section{Background and Source Contract}
-Triton-Distributed's documented API includes rank queries, symmetric addressing, signal notification, waiting, and token consumption. The audited source revision begins with \texttt{1e6d6881} (2026-08-24); its full identifier is recorded in the data-availability statement. We use its Python API, distributed operation definitions, language documentation, semantics documentation, and notify--wait tutorial as evidence for the source-level operation shapes.
+Distributed kernels execute across ranks that own distinct portions of a computation but may communicate through remotely addressable, symmetric allocations. A rank can form an address for a peer's corresponding allocation, issue communication or computation, and coordinate progress with signals. This setting makes synchronization more than a control-flow concern: the consumer must establish that the producer's relevant data is ready and that the dependency remains attached to the later data access. The paper focuses on one documented notify--wait--consume--load pattern rather than attempting to model this broader execution environment.
 
-The source API describes \texttt{wait} as returning an integer token and \texttt{consume\_token(value, token)} as introducing a dependency associated with a later use of \texttt{value}. In the tutorial idiom, the consumer waits, consumes the token with a data value, and loads the value. This motivates modeling a capability discipline. The API description does not itself prove that arbitrary source tokens have valid provenance, that a token corresponds to a particular data pointer, or that compiler transformations and target hardware preserve the intended ordering.
+\paragraph{The source interface.} The audited Triton-Distributed checkout provides rank and world-size queries, symmetric addressing, signal notification, waiting, token consumption, and ordinary data operations. We use the Python API, distributed operation definitions, language and semantics documentation, and the notify--wait tutorial at revision \texttt{1e6d6881} (2026-08-24). The full revision is included in the data-availability statement. These sources establish the operation shapes and motivate the selected pattern; they are not treated as a formal semantics for all source programs.
+
+\paragraph{Producer--consumer pattern.} In the tutorial-shaped idiom, a producer writes data and notifies a signal associated with a consumer. The consumer waits for the expected signal state, receives a token, associates that token with a data value using \texttt{consume\_token(value, token)}, and subsequently loads through the relevant pointer. Informally, the signal communicates progress, while token consumption makes the synchronization dependency relevant to the data use. The exact details of signal setup, allocation, rank selection, and reuse belong to the surrounding program and are outside the small protocol modeled here.
+
+\paragraph{What the token means here.} At the source interface, the wait result is represented as an integer token, and \texttt{consume\_token} is described as introducing a dependency associated with its value operand. An integer type alone cannot express where a token came from or which data access it justifies. The core therefore distinguishes the token's static scalar type from its abstract metadata and capability history: a successful wait creates pending evidence, a matching consume transforms that evidence into an ordering witness for a value, and a guarded load consults that witness. This is a formal design choice for the calculus, not a claim that the source API's integer token intrinsically carries all of this metadata.
+
+\paragraph{From source operations to abstract actions.} The source audit records a deliberately partial correspondence. Rank and symmetric-addressing operations motivate typed rank and pointer values; notify and wait motivate signal and wait actions; consume motivates a transition that requires a matching pending token; and load motivates a transition guarded by an ordering witness. The model abstracts away pointer lowering, address calculation, general tensor values, program control flow, concurrency scheduling, and the complete semantics of the source language. The accompanying AST validator checks selected tutorial call shapes; it is a source-pattern check, not a translation into Lean and not a proof that the source executes according to the core semantics.
+
+\paragraph{Ordering and visibility boundary.} The intended reasoning depends on two distinct obligations. First, a successful wait must be justified by a visible notification under the relevant scope and ordering. Second, the dependency introduced by token consumption must remain effective until the data load. In this calculus, the first obligation appears as the explicit premise \texttt{NotificationVisible}; the second appears as the requirement for a matching consumed ordering witness at load. Scope and ordering metadata are recorded and matched abstractly, but the model contains no weak-memory execution relation and derives neither obligation from a particular backend. Establishing those facts requires target- and compiler-specific evidence, as detailed in the limitations and memory-model discussion.
+
+The resulting contract is intentionally conditional: if the abstract transition system admits a load, then its state must contain the corresponding protocol evidence. The theorem proved later reconstructs the wait and consume origins of that evidence from the trace. Connecting this conditional result to Triton-Distributed executions would additionally require a source/IR translation, a simulation argument, compiler dependency-preservation evidence, and a backend refinement for notification visibility. The current artifact supplies none of those end-to-end links; it makes their exact role explicit.
 
 \section{Core Calculus}
 This section gives the model in enough detail to reconstruct its definitions and
@@ -752,11 +782,92 @@ The results rely on explicit premises and omitted mechanisms:
 A stronger result would require a typed source or IR subset, a translation into the core, a simulation theorem, and evidence or a formal refinement connecting visibility and dependency preservation to each supported backend. Targeted litmus tests and signal-reuse tests would complement, but not replace, those proofs.
 
 \section{Related Work}
-Triton-Distributed and TileLink study programming and optimization techniques for overlapping communication and computation on distributed accelerators \cite{zheng2025tritondistributed,zheng2025tilelink}. Our work does not reproduce their compiler or performance evaluations; it isolates a small synchronization protocol for mechanized trace reasoning.
+\paragraph*{Distributed accelerator programming.} Triton-Distributed provides a programming model for distributed GPU kernels,
+including communication and synchronization operations intended to overlap
+communication with computation \cite{zheng2025tritondistributed}. TileLink
+studies tile-centric primitives and optimization techniques for generating
+such overlapping kernels \cite{zheng2025tilelink}. These works address the
+programming model and performance of distributed accelerator computations;
+our goal is different. We isolate one wait--consume--load discipline and
+formalize the trace evidence required by an abstract machine before it
+permits a load. The calculus does not model the complete Triton-Distributed
+language, reproduce its compiler, or establish the performance or correctness
+of its kernels.
 
-Concurrent separation logics such as Iris provide general reasoning principles for higher-order concurrency \cite{jung2018iris,timany2024logical}. Aneris and Trillium address distributed reasoning and intensional refinement \cite{krogh2020aneris,timany2024trillium}, while Actris integrates session-typed protocols with separation logic \cite{hinrichsen2020actris}. These frameworks have substantially broader logical foundations than the present transition system; our development does not encode them.
+\paragraph*{Choreographic programming and session types.} Choreographic programming describes interactions from a global perspective:
+a protocol specifies the roles and communication events of a distributed
+computation, and endpoint programs are obtained by projecting that
+description. Multiparty session types provide related techniques for
+specifying structured conversations and checking that participants respect
+their communication protocols \cite{honda2016multiparty}. Such approaches
+typically reason about the consistency of multiple participants and, in
+some settings, communication safety or progress.
 
-Weak-memory logics and executable memory models emphasize that ordering and visibility must be justified by a target semantics \cite{kaiser2017strong,alglave2010fences}. Kami demonstrates mechanized hardware specification and refinement \cite{chlipala2017kami}. GPUVerify targets GPU-kernel race and barrier-divergence properties, while CompCert proves semantic preservation for a defined compiler pipeline \cite{rival2012gpuverify,leroy2009compcert}. The present work supplies none of those end-to-end guarantees. The comparison is focused and does not support a novelty or priority claim.
+The present calculus is adjacent to this line of work, but it is not a
+choreography or a multiparty session-type system. It has no global protocol
+syntax, endpoint projection, or collection of independently executing
+rank-indexed processes. Its trace is an abstract sequence of enabled actions,
+not a theorem that projected endpoints implement a global specification.
+The connection is instead at the protocol level: ranks and signal metadata
+identify participants and communication resources, while pending and
+consumed capabilities record local obligations induced by synchronization.
+A choreography-aware extension could define a global producer--consumer
+protocol, project it to rank-indexed actions, and prove that the projected
+traces are admitted by this calculus. The current provenance theorem could
+then serve as a local obligation in a larger projection or refinement proof.
+
+\paragraph*{Session-typed and separation-logic reasoning.} Session-typed reasoning in Actris combines protocol specifications with
+separation logic, enabling modular reasoning about communication and shared
+resources \cite{hinrichsen2020actris}. Iris provides a general foundation
+for higher-order concurrent separation logic \cite{jung2018iris}, while
+Aneris and Trillium develop mechanized reasoning for distributed systems and
+intensional refinement \cite{krogh2020aneris,timany2024trillium}.
+These frameworks have substantially richer accounts of concurrency,
+resources, and composition than the transition system studied here. Our
+pending and consumed records are protocol resources in a narrower sense:
+they record the origin and use of a synchronization capability, but are not
+assertions in a separation logic and do not support modular reasoning about
+arbitrary concurrent components. The artifact therefore complements rather
+than implements these logical frameworks. General work on logical type
+soundness provides a broader account of the relationship between typing and
+semantic safety \cite{timany2024logical}; our preservation results concern
+only the specific runtime predicates of the encoded calculus.
+
+\paragraph*{Weak memory and synchronization semantics.} A synchronization protocol is meaningful only relative to an account of
+ordering and visibility. Work on release--acquire reasoning and weak-memory
+fences studies how synchronization operations constrain observable
+executions \cite{kaiser2017strong,alglave2010fences}. In our model,
+\texttt{NotificationVisible} is an explicit premise of a successful wait.
+The calculus proves that a permitted load has the required abstract
+wait--consume history; it does not derive visibility from a weak-memory
+semantics, nor does it establish that a particular CANN, CUDA, NVSHMEM, or
+ROCSHMEM operation implements that premise. This separation makes the
+backend obligation visible, but leaves its justification to a future
+target-specific semantics or refinement proof.
+
+\paragraph*{GPU verification, hardware models, and compiler correctness.} GPUVerify checks classes of data races and barrier-divergence errors in GPU
+kernels \cite{rival2012gpuverify}. Kami demonstrates mechanized hardware
+specification and modular verification \cite{chlipala2017kami}, while
+CompCert proves semantic preservation for a defined compiler pipeline
+\cite{leroy2009compcert}. These works address different layers and broader
+properties than our abstract protocol theorem. In particular, we do not
+prove race freedom, hardware refinement, or preservation of synchronization
+dependencies through compiler optimization and lowering. The capability
+trace provides a candidate intermediate-level property for such a proof:
+a compiler account could relate source or IR dependencies to the abstract
+consume capability and then show that the target implementation preserves
+the corresponding ordering.
+
+\paragraph*{Positioning.} The contribution is thus narrower than choreographic programming, session
+typing, weak-memory verification, GPU-kernel verification, or compiler
+verification. It is a mechanized local protocol model with a provenance
+invariant: from empty initial capability state, every load admitted by the
+abstract transition relation has an earlier matching wait and consume.
+Connecting this result to global protocol specifications or executable
+Triton-Distributed kernels requires additional endpoint projection,
+source-to-core translation, compiler-preservation, and backend-refinement
+results. The comparison is focused rather than systematic and does not
+establish novelty or priority relative to all related work.
 
 \section{Conclusion}
 We presented a Lean core calculus for a wait--consume--load synchronization discipline motivated by Triton-Distributed. The mechanized provenance invariant and universal load theorem show that the transition system itself requires a matching earlier wait and consume before it permits a load. A source-pattern audit checks selected examples and exposes, rather than closes, the gap between source operations and the abstract calculus. The immediate technical value is a precise statement of the obligations a future source-to-core and backend-refinement account must discharge. Establishing such a connection, and validating target-specific memory-ordering assumptions, remains future work.
