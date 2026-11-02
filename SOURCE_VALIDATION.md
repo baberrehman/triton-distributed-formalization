@@ -8,7 +8,7 @@ This file defines what is validated against Triton-Distributed source and what r
 
 Audited checkout: `../../yuling/Triton-distributed-ascend`
 
-Revision: `1e6d6881cddf645759aa250c94b4157355aa57dc`
+Revision: `1e6d688`
 
 Primary evidence:
 

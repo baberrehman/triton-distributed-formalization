@@ -22,7 +22,7 @@ The current source/API describes:
 
 Evidence is in `../../yuling/Triton-distributed-ascend/python/triton_dist/language/distributed_ops.py`, `../../yuling/Triton-distributed-ascend/include/TritonDistributed/Dialect/Distributed/IR/DistributedOps.td`, and that repository's API/semantics documentation and notify-wait tutorial. These files should be pinned to a commit in any submission.
 
-Revision audited during this session: `1e6d6881cddf645759aa250c94b4157355aa57dc`. Re-audit the API and semantics if the source revision changes.
+Revision audited during this session: `1e6d688`. Re-audit the API and semantics if the source revision changes.
 
 ## Current abstraction boundary
 

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Iterable
 
 
-DEFAULT_REVISION = "1e6d6881cddf645759aa250c94b4157355aa57dc"
+DEFAULT_REVISION = "1e6d688"
 DEFAULT_SOURCE = Path(__file__).resolve().parents[3] / "yuling" / "Triton-distributed-ascend"
 
 

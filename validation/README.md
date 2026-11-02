@@ -3,7 +3,7 @@
 `validate_source_patterns.py` is a deliberately small, standard-library-only
 validator for three committed examples in the pinned checkout
 `/home/baber/baberrehman/yuling/Triton-distributed-ascend` at revision
-`1e6d6881cddf645759aa250c94b4157355aa57dc`:
+`1e6d688`:
 
 | Pattern | Source | Checked shape |
 | --- | --- | --- |

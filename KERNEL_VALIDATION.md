@@ -3,7 +3,7 @@
 ## Purpose and scope
 
 This document records an executable source audit against the Triton-distributed
-checkout pinned to `1e6d6881cddf645759aa250c94b4157355aa57dc`. The audit is a
+checkout pinned to `1e6d688`. The audit is a
 three-pattern API and source-order check. It is not a kernel execution test,
 compiler validation, source-to-Lean translation, communication simulation, or
 hardware-memory-model experiment.
