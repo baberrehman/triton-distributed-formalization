@@ -28,8 +28,8 @@ Revision audited during this session: `1e6d688`. Re-audit the API and semantics 
 
 `TritonDistributed/Core.lean` and `TritonDistributed/Transition.lean` are still not a full semantics of that API:
 
-1. `rankId` embeds a concrete rank instead of evaluating an axis query.
-2. `wait` uses a scalar signal identifier and a positive-counter test; the API waits on pointer/count/value with scope and semantic parameters.
+1. `rank(axis)` and `numRanks(axis)` retain an axis argument, but evaluation ignores it; rank returns the state's current rank.
+2. Wait expression evaluation uses variable identifiers as count and expected operands without looking up their values. The abstract transition action directly supplies rank, address, expected value, and token variable.
 3. The transition layer models `consume_token` over environment variables and creates an explicit capability, but does not yet represent arbitrary SSA values or token dataflow.
 4. `.load` is an ordinary load whose transition requires the consumed capability. Upstream uses `consume_token` followed by ordinary `tl.load`; the source-to-core simulation is still pending.
 5. Signal readiness and memory ordering remain simplified: notification state is explicit, while scope, acquire/release, compiler reordering, and hardware visibility are represented by assumptions and witnesses.
@@ -53,7 +53,7 @@ A publication-grade formalization should, at minimum:
 6. Add mechanized examples and counterexamples, including the queue/reuse pattern from the notify-wait tutorial and a deliberately incorrect variant.
 7. Audit trusted assumptions and ensure no theorem depends on `sorry`, hidden axioms, or unreviewed external assumptions.
 
-The general trace-level provenance theorem is implemented as `load_has_prior_wait_and_consume`. Given a trace from empty pending and consumed lists and a permitted final load, it proves a decomposition of the action list into `prefix ++ [wait] ++ middle ++ [consume] ++ suffix`, with matching rank, address, token, scope, ordering, and pointer typing. The supporting invariant `trace_preserves_capability_origins` establishes historical origins for pending and consumed capabilities across arbitrary traces. This remains a theorem about the prototype transition calculus; it is not a source-to-core or backend-refinement theorem.
+The trace theorem `load_has_prior_wait_and_consume` assumes empty initial pending and consumed lists and a permitted final load. It gives `prefix ++ [wait] ++ middle ++ [consume] ++ suffix` plus a final symmetric pointer at the loaded variable/rank/address. The consumed record stores value variable, token variable, signal address, and rank; scope/order are recovered from the wait, and wait expected/token observed values are not equated. The middle contains only supported actions (notify, wait, consume, load), not arbitrary computation. This is a calculus result, not source-to-core or backend refinement.
 
 ## Required evaluation and paper work
 

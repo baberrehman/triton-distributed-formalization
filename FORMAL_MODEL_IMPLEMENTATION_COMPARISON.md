@@ -7,7 +7,7 @@ This report compares the Lean core calculus in this directory with the implement
 - `Triton-distributed-ascend`
 - audited source revision: `1e6d688`
 
-The Lean model is **stricter than the implementation interface** for the specific capability discipline it formalizes. A permitted `Action.load` must be preceded, in the modeled machine state, by a matching consumed capability. A consumed capability must have matching pointer, token, rank, address, scope, and ordering metadata, and must originate from a pending capability created by a successful `wait`. Consequently, `load_has_prior_wait_and_consume` proves that every permitted load from empty initial capability lists has an earlier matching `wait` and `consume` in the abstract trace.
+The Lean model is **stricter than the implementation interface** for the specific capability discipline it formalizes. A permitted `Action.load` must be preceded, in the modeled machine state, by a consumed capability. `Step.consume` matches pointer/token address and pending token/rank/address/scope/ordering metadata. The consumed record itself stores only value variable, token variable, address, and rank. Consequently, `load_has_prior_wait_and_consume` proves an abstract wait/consume action-list decomposition from empty initial capability lists, plus a final pointer at the loaded variable/rank/address; it does not match all wait metadata at load or equate expected and observed values.
 
 The implementation does not provide the same end-to-end static or dynamic guarantee. Its Python API accepts a token and a value at `consume_token`; the compiler/IR is responsible for preserving the dependency and the backend is responsible for giving it the intended ordering semantics. The implementation therefore can accept programs that are rejected by the Lean transition relation, and incorrect behavior can arise if the source program, compiler transformation, pointer/signal pairing, signal epoch, or backend memory ordering violates the intended protocol.
 
@@ -24,7 +24,7 @@ The relevant definitions are in `TritonDistributed/Transition.lean`:
    - token address to equal pointer address;
    - a pending token with matching token variable, rank, address, scope, and ordering.
 3. `Step.consume` removes the pending capability and creates a `ConsumedOrdering` capability.
-4. `Step.load` requires a valid pointer and a consumed capability matching the pointer variable, rank, and signal address.
+4. `Step.load` requires a symmetric pointer and consumed capability matching pointer variable, rank, and address; it does not check rank bounds.
 5. `trace_preserves_capability_origins` preserves historical provenance through arbitrary traces.
 6. `load_has_prior_wait_and_consume` derives the universal action-list decomposition from empty `pending` and `consumed` lists.
 
@@ -36,7 +36,7 @@ Thus, within the model, the following bad shapes are not valid completed traces:
 - consuming a token for one pointer and loading an unrelated pointer/rank/address;
 - loading a pointer that is not represented by the required typed environment value.
 
-The guarantee is conditional on the model's premises, especially `NotificationVisible`, typed environments, and the abstract pointer/capability state.
+The provenance theorem itself has no `WellTypedMachine` premise. Separate typing-preservation theorems do require well-typed machine premises. `NotificationVisible` concretely means positive signal value, in-range signal owner, and scope `gpu` or `system`; it has no ordering or memory-visibility predicate.
 
 ## What the implementation exposes
 

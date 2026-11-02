@@ -16,7 +16,7 @@ from typing import Iterable
 
 
 DEFAULT_REVISION = "1e6d688"
-DEFAULT_SOURCE = Path(__file__).resolve().parents[3] / "yuling" / "Triton-distributed-ascend"
+DEFAULT_SOURCE = Path(__file__).resolve().parents[3] / "Triton-distributed-ascend"
 
 
 @dataclass(frozen=True)
