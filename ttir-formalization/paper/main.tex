@@ -1,0 +1,624 @@
+\documentclass[a4paper,USenglish,anonymous]{lipics-v2021}
+\bibliographystyle{plainurl}
+\hideLIPIcs
+\usepackage{booktabs}
+\usepackage{stmaryrd}
+\SetSymbolFont{stmry}{bold}{U}{stmry}{m}{n}
+\newcommand{\BV}{\mathbb{B}_{32}}
+\newcommand{\Fin}{\mathsf{Fin}}
+\newcommand{\Ten}{\mathsf{Tensor}}
+\newcommand{\Src}{\mathsf{S}}
+\newcommand{\Tgt}{\mathsf{T}}
+\newcommand{\lo}{\mathcal{L}}
+\newcommand{\word}[1]{\langle #1\rangle_{32}}
+\newcommand{\se}[1]{\llbracket #1\rrbracket^{\Src}_{\rho}}
+\newcommand{\te}[1]{\llbracket #1\rrbracket^{\Tgt}_{\rho}}
+\newcommand{\op}[1]{\ensuremath{\mathsf{#1}}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\title{A Mechanized Tensor Core for TTIR-to-TTAdapter Lowering}
+\titlerunning{A Mechanized Tensor Core for TTIR-to-TTAdapter Lowering}
+\author{Anonymous Author}{}{}{}{}
+\authorrunning{Anonymous Author}
+\Copyright{Anonymous Author}
+\ccsdesc[500]{Software and its engineering~Formal software verification}
+\ccsdesc[500]{Software and its engineering~Compilers}
+\keywords{tensor compilers, Triton, MLIR, Lean, semantic preservation, bit vectors}
+\begin{document}
+\maketitle
+\begin{abstract}
+Tensor compiler transformations often look elementary while depending on shape
+conditions, finite-width arithmetic, and initialization conventions. We present
+a source-audited Lean formalization of two conversion patterns in an Ascend
+Triton compiler: splat and range construction. The source language contains
+rank-one i32 tensors, inputs, splats, bounded ranges, and pointwise addition.
+The target language separates index generation, fill, insertion into an
+arbitrarily initialized tensor, and addition. A shape-indexed lowering selects
+insertion for singleton splats and fill otherwise; range lowering either
+returns generated indices or adds a filled signed offset. We prove equality
+of source and target tensor values for every expression and environment, and
+derive independence from the initial contents assigned to empty tensors.
+Ten checked examples exercise signed starts, arithmetic wraparound, and two
+incorrect hypothetical translations. The development uses exact 32-bit words
+and includes a principal-theorem axiom audit. Its compiler correspondence is
+manual: TTAdapter is a mixed-IR pipeline stage, and neither the full stage nor
+the C++ implementation is verified. The resulting case study makes the
+local semantic obligations precise while exposing the additional evidence
+needed for implementation-level correctness.
+\end{abstract}
+
+\section{Introduction}
+Triton expresses tiled computations through an intermediate language and
+compiler designed for neural-network workloads~\cite{triton}. In an
+MLIR-based implementation, a tensor operation can be represented at several
+levels of abstraction before reaching executable code. MLIR deliberately
+supports such heterogeneous representations and transformations~\cite{mlir}.
+For verification, this flexibility raises a basic question: which semantic
+claim is justified by a proof of a particular lowering pattern?
+
+Consider a scalar splat into a tensor. Filling every lane with the scalar
+appears straightforward, but a compiler can instead insert the scalar into
+an empty tensor when the result has exactly one element. The optimization
+depends on a shape fact: the single write must cover every observable lane.
+Similarly, a range beginning at zero can be implemented by generated loop
+indices, whereas a nonzero range requires an offset. The offset is signed,
+the result is a 32-bit word, and addition is not unrestricted integer
+addition. Ignoring any of these distinctions can make a superficially
+plausible account of the translation inaccurate.
+
+We formalize these two patterns from a pinned Ascend Triton checkout. The
+destination artifact is called \code{ttadapter} by its Python compiler
+driver. It is a pipeline stage, not the name of a single MLIR dialect. We
+therefore introduce an abstract target language for the selected computations
+rather than claiming to define the semantics of every operation in a
+TTAdapter module. Our source language is similarly a restricted tensor core,
+not the complete TTIR language.
+
+The central theorem is a universal equality, not an enumeration of tests.
+For every source expression, every shape permitted by its constructors, and
+every environment, evaluating the lowered expression yields the same tensor
+as evaluating the source expression. Both languages use 32-bit bit vectors.
+The target explicitly distinguishes a full fill from insertion at index zero
+into a tensor with arbitrary initial contents. Consequently, a corollary
+states that the output of the lowering cannot depend on those contents.
+
+This result has a deliberately limited interpretation. The source and target
+denotations are manually specified. The translation is a Lean function
+written to reflect inspected C++ branches, not code extracted from that
+compiler. We neither execute the compiler nor compare generated MLIR in
+this study. The contribution is a small, checked semantic specification and
+an explicit implementation correspondence, not verification of Triton,
+Ascend, or an end-to-end compilation pipeline.
+
+\paragraph{Contributions.}
+\begin{itemize}
+\item A shape-indexed, rank-one i32 source and target core that distinguishes
+signed range attributes, modular arithmetic, and partial initialization.
+\item Mechanized preservation proofs for both splat branches, both range
+branches, and their expression-tree compositions with addition.
+\item A corollary proving independence from arbitrary empty-tensor contents,
+and ten checked examples including two hypothetical bad-lowering witnesses.
+\item A revision-specific source audit that separates proven abstractions
+from unverified compiler, representation, and execution obligations.
+\end{itemize}
+We make no claim of a new general compiler-verification technique or priority
+over all tensor formalizations. The value of the case study is its precise
+scope, correspondence to concrete implementation branches, and reproducible
+proof artifact.
+
+\section{Compiler Boundary and Motivating Patterns}\label{sec:source}
+The audited checkout is the \code{3rdparty/triton-ascend} subdirectory of a
+Triton-distributed-ascend repository at revision
+\begin{center}
+\code{fdecef82c42cade68b4039af35a0e06ac8851536}.
+\end{center}
+All source anchors in this paper refer to that revision. We use the operation
+declarations, verifier, conversion patterns, and Python driver as evidence
+about implementation structure. This is a manual audit; the revision is not
+a certificate relating executable compiler behavior to Lean.
+
+\subsection{The stage is larger than the modeled transformation}
+The driver registers \code{stages["ttadapter"]} through
+\code{ttir_to_linalg} with named operations enabled. That function invokes
+several passes, including control-flow and structure transformations, before
+returning the transformed module text. Temporary and dumped output uses the
+name \code{kernel.ttadapter.mlir}. A pure-SIMT route can bypass this stage.
+Thus, even complete proofs of the selected conversion patterns would not
+establish preservation by every preceding or following pass.
+
+Our mathematical boundary is a pure tensor computation with fixed inputs.
+We retain only the value-relevant parts of splat and range construction and
+provide addition for composition. Source addition is an abstract signless
+i32 arithmetic operation, not a claimed \code{tt.add} instruction. Inputs
+allow the theorem to quantify over arbitrary tensors rather than only
+closed constant expressions.
+
+\subsection{Splat: a full write or a singleton write}
+The inspected splat converter creates an empty result tensor. If every
+dimension equals one, it inserts the scalar at all-zero indices. Otherwise
+it emits a fill. For the rank-one shapes modeled here, the test reduces to
+whether the length is one. It is incorrect to describe this implementation
+as unconditionally lowering splat to fill.
+
+For a singleton tensor, insertion and fill have the same value at the sole
+valid index. For length four, inserting only at index zero does not establish
+the values of the other three lanes. The formal target makes this distinction
+observable by assigning arbitrary values to the initially empty tensor.
+This is a mathematical model of unspecified contents, not a semantics of
+poison propagation or an assertion that an actual allocation contains
+particular machine words.
+
+\subsection{Range: generated indices and a signed offset}
+The range converter constructs a \code{linalg.generic} operation with
+identity indexing and a parallel iterator. Its body obtains the loop index,
+casts it to i32, and yields it. With start zero, this tensor is the result.
+With nonzero start, the converter fills another tensor with the signed start
+constant and combines it with the index tensor using \code{arith.addi}.
+
+The declaration of \code{tt.make_range} explicitly warns that generated
+accessors can return unsigned values although the attributes represent
+signed i32. The inspected converter and verifier read the signed attribute
+through \code{getStartAttr().getInt()}. Our model consequently encodes the
+start with \code{BitVec.ofInt}, not an unchecked conversion to a natural
+number. An example starting at $-2$ tests this choice.
+
+The verifier requires a nonempty interval, a rank-one result, a length equal
+to the difference between endpoints, and i32 elements. We encode a restricted
+well-formed range directly in the source constructor. We do not model parsing
+attributes or prove equivalence with the full verifier.
+
+\section{A Shape-Indexed Tensor Core}\label{sec:core}
+\subsection{Words, shapes, and environments}
+Let $\BV$ be the set of 32-bit words, represented by Lean's
+\code{BitVec 32}. Write $\word{z}$ for conversion of an integer $z$ to its
+32-bit representation, and $u\oplus v$ for addition modulo $2^{32}$.
+For a natural number $n$, define
+\[
+ \Fin(n)=\{i\in\mathbb N\mid i<n\},\qquad
+ \Ten(n)=\Fin(n)\to\BV.
+\]
+The Lean representation is \code{Fin n → BitVec 32}. This is an extensional
+tensor semantics: two tensors are equal when their values at every valid
+index are equal. It says nothing about physical layout or memory addresses.
+
+An environment $\rho=(I,U)$ contains two total families:
+\[
+ I : \prod_{n:\mathbb N}(\mathbb N\to\Ten(n)),
+ \qquad U : \prod_{n:\mathbb N}\Ten(n).
+\]
+$I(n,x)$ supplies input identifier $x$ at shape $n$, while $U(n)$ supplies
+the initial contents used by the target's insertion operation. Input
+identifiers are shape-indexed; the same natural number at a different shape
+does not impose a consistency condition. The model does not implement SSA
+names, dominance, or a variable-binding discipline.
+
+The family $U$ chooses one tensor per shape. It does not provide independent
+fresh choices for each allocation, nor temporal nondeterminism. Our theorem
+is independence from this explicitly encoded family. Establishing refinement
+from a more detailed nondeterministic or poison-aware semantics remains a
+separate obligation.
+
+\subsection{The range domain}
+For a signed start $s\in\mathbb Z$ and length $n\in\mathbb N$, set
+\begin{equation}\label{eq:valid}
+ V(s,n)\quad\equiv\quad
+ 0<n\;\land\;-2^{31}\leq s\;\land\;s+n\leq 2^{31}-1.
+\end{equation}
+The exclusive end is represented by $s+n$, not a separate stored parameter.
+Since the interval is nonempty, these inequalities also bound the start
+above and the end below. Both endpoints are representable as signed i32.
+An exclusive end of $2^{31}$ is intentionally excluded even if some
+mathematical lane sequence ending just before it would be representable.
+
+The \code{makeRange} constructor carries a proof of $V(s,n)$. Range
+validation is therefore a construction obligation rather than a possible
+failure of the evaluator. Other constructors may have length zero: their
+denotations are empty functions. This does not assert that every such shape
+is legal in the actual TTIR implementation.
+
+\subsection{Indexed syntax}
+For each $n$, the source syntax $\Src_n$ has the following constructors:
+\[
+ e ::= \op{input}_n(x)\mid\op{splat}_n(v)
+       \mid\op{range}_n(s,h)\mid e_1+_n e_2,
+ \qquad h:V(s,n).
+\]
+Both operands of $+_n$ belong to $\Src_n$. The target syntax $\Tgt_n$ is
+\[
+ t ::= \op{input}_n(x)\mid\op{fill}_n(v)
+       \mid\op{insert0}_n(v)\mid\op{index}_n\mid t_1+_n t_2.
+\]
+Here $v\in\BV$. The size indices are part of the inductive Lean types,
+so ill-shaped additions cannot be constructed. In particular, a function
+of type $\Src_n\to\Tgt_n$ preserves the represented length by construction.
+This intrinsic property must not be confused with a separate theorem
+about the real compiler's type converter.
+
+\subsection{Source and target denotations}
+For $i\in\Fin(n)$, source evaluation is defined by
+\begin{align*}
+ \se{\op{input}_n(x)}(i)&=I(n,x)(i),\\
+ \se{\op{splat}_n(v)}(i)&=v,\\
+ \se{\op{range}_n(s,h)}(i)&=\word{s}\oplus\word{i},\\
+ \se{e_1+_n e_2}(i)&=\se{e_1}(i)\oplus\se{e_2}(i).
+\end{align*}
+The range denotation is modular from the outset. Bounds on the corresponding
+mathematical integers are proved separately. We have not mechanized a general
+bridge stating that signed decoding of every computed range word equals
+$s+i$ under $V(s,n)$. Such a bridge is not needed by the preservation proof,
+but would strengthen correspondence to a mathematical range specification.
+
+Target evaluation uses the following equations:
+\begin{align*}
+ \te{\op{input}_n(x)}(i)&=I(n,x)(i),\\
+ \te{\op{fill}_n(v)}(i)&=v,\\
+ \te{\op{insert0}_n(v)}(i)&=
+       \begin{cases}v&i=0,\\U(n)(i)&i\ne0,\end{cases}\\
+ \te{\op{index}_n}(i)&=\word{i},\\
+ \te{t_1+_n t_2}(i)&=\te{t_1}(i)\oplus\te{t_2}(i).
+\end{align*}
+The \op{index} constructor compresses index generation, cast, and yield
+into one pure operation. It presupposes that the surrounding index
+representation can express the modeled loop indices; no MLIR data-layout
+or index-width theorem is provided. The \op{insert0} constructor has a
+total denotation even at length zero, where there are no valid observations.
+It is not a semantics of invalid \code{tensor.insert} operations. The
+lowering emits it only at length one.
+
+\section{Lowering and Semantic Preservation}\label{sec:proofs}
+Define $\lo:\Src_n\to\Tgt_n$ structurally. Inputs are preserved and
+addition lowers recursively. The interesting cases are
+\begin{align}
+ \lo(\op{splat}_n(v))&=
+ \begin{cases}
+ \op{insert0}_n(v)&n=1,\\
+ \op{fill}_n(v)&n\ne1,
+ \end{cases}\label{eq:splat}\\
+ \lo(\op{range}_n(s,h))&=
+ \begin{cases}
+ \op{index}_n&s=0,\\
+ \op{index}_n+_n\op{fill}_n(\word{s})&s\ne0.
+ \end{cases}\label{eq:range}
+\end{align}
+The range witness $h$ does not affect the generated target expression.
+It establishes membership in the chosen source domain. In fact, the
+bit-vector identity underlying the range proof does not require its bounds;
+the bounds concern admissibility and the intended signed-range reading.
+
+\begin{lemma}[Splat preservation]\label{thm:splat}
+For every $n,v,\rho$, evaluating the right-hand side of
+Equation~\eqref{eq:splat} yields the constant tensor with value $v$.
+\end{lemma}
+\begin{proof}
+By extensionality, fix $i\in\Fin(n)$. If $n=1$, then $0\leq i<1$
+implies $i=0$. Target insertion therefore returns $v$, not $U(n)(i)$.
+If $n\ne1$, the target is a fill and returns $v$ at every valid index.
+These are exactly the source splat values. The length-zero case in the
+second branch is vacuous.
+\end{proof}
+This is \code{lower_splat_correct}. Its singleton argument is not an
+assumption that empty tensors are zero: it proves that no initial value is
+observed. This distinction is essential to the negative example in
+Section~\ref{sec:examples}.
+
+\begin{lemma}[Range preservation]\label{thm:range}
+For every $n,s,h:V(s,n),\rho$, evaluation of the right-hand side of
+Equation~\eqref{eq:range} equals $i\mapsto\word{s}\oplus\word{i}$.
+\end{lemma}
+\begin{proof}
+Fix a valid index $i$. If $s=0$, the target returns $\word{i}$ and the
+source returns $\word{0}\oplus\word{i}$, equal by the zero identity.
+Otherwise, the target returns $\word{i}\oplus\word{s}$. Commutativity
+of bit-vector addition gives the source value. Extensionality gives equality
+of the tensors.
+\end{proof}
+The Lean theorem \code{lower_range_correct} uses
+\code{BitVec.add_comm}. It establishes the equality for finite-width
+operations; no silent replacement by unbounded addition occurs.
+
+\begin{theorem}[Lowering correctness]\label{thm:main}
+For every $n$, environment $\rho$, and expression $e\in\Src_n$,
+\[\te{\lo(e)}=\se{e}.\]
+\end{theorem}
+\begin{proof}
+Proceed by structural induction on $e$. The input case follows from the
+shared environment lookup. Lemmas~\ref{thm:splat} and~\ref{thm:range}
+discharge the splat and range cases. For $e_1+_n e_2$, fix a lane $i$.
+The target adds the values of $\lo(e_1)$ and $\lo(e_2)$ at $i$. The
+induction hypotheses replace these with the source values of $e_1$ and
+$e_2$, after which the source addition equation applies. Extensionality
+finishes the case.
+\end{proof}
+The machine-checked statement is \code{lowering_correct}. It covers all
+finite expression trees in the grammar, arbitrary input tensors, and
+arbitrary $U$.
+
+The corollary \code{lowering_lane_correct} specializes the equality to
+any $i\in\Fin(n)$. There is no execution
+trace, concurrency relation, or termination claim about the compiler here.
+
+\subsection{Independence from initial contents}
+Source evaluation never consults $U$. Structural induction proves that
+environments with equal input families give equal source results; the
+artifact calls this \code{source_ignores_empty}. Combining this property
+with Theorem~\ref{thm:main} gives a target property.
+
+\begin{corollary}[Empty-content independence]\label{thm:empty}
+If $\rho_1=(I,U_1)$ and $\rho_2=(I,U_2)$, then for every $e\in\Src_n$,
+\[
+ \llbracket\lo(e)\rrbracket^{\Tgt}_{\rho_1}
+ =\llbracket\lo(e)\rrbracket^{\Tgt}_{\rho_2}.
+\]
+\end{corollary}
+\begin{proof}
+Rewrite each side to its source denotation using Theorem~\ref{thm:main},
+then apply source independence.
+\end{proof}
+This is \code{lowering_ignores_empty}. It is stronger than checking
+results with a particular zero-initialized environment, but narrower than
+proving absence of undefined behavior in generated MLIR. The theorem is
+about the stated value model and the image of $\lo$, not every target term.
+Indeed, a general \op{insert0} term at length greater than one may depend
+on $U$.
+
+\subsection{Mathematical range bounds}
+The artifact separately checks
+\begin{align*}
+ s&\leq s+i<s+n,\\
+ -2^{31}&\leq s+i<2^{31}-1
+\end{align*}
+for a valid range and lane. These are \code{range_lane_bounds} and
+\code{range_lane_signed_bounds}. The first inequality only needs
+$i\in\Fin(n)$; its range-validity parameter is unused in the proof.
+The second uses the endpoint bounds. Its strict upper bound follows from
+the exclusive end, itself bounded above by $2^{31}-1$. These integer facts
+are not a substitute for the unproved general signed-decoding bridge
+identified in Section~\ref{sec:core}.
+
+\section{Mechanization and Checked Examples}\label{sec:examples}
+The implementation uses Lean 4.19.0 and its bundled \code{Std} library,
+with no external library dependencies. Lean supports both the functional
+definitions and their proofs in one language~\cite{lean4}. The development
+separates the core definitions, lowering proofs, examples, and an axiom
+inspection file. It is independent of the neighboring synchronization
+formalization; no synchronization result is imported to justify tensor
+lowering.
+
+\begin{table}[t]
+\caption{Artifact structure and checked evidence. Paths are relative to the
+formalization root, one directory above this paper.}\label{tab:artifact}
+\centering
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+File & Role \\
+\midrule
+\code{TTIRFormal/Core.lean} & Indexed syntax, denotations, two integer-bound theorems.\\
+\code{TTIRFormal/Lowering.lean} & Lowering, two local preservation results, composition, lane equality, and two independence results.\\
+\code{TTIRFormal/Examples.lean} & Ten concrete example and counterexample theorems.\\
+\code{TTIRFormal/Audit.lean} & Axiom dependencies of eight principal results.\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{Positive cases}
+The example environment supplies zero-valued inputs and assigns 99 to
+every initially empty lane. A length-four range starting at $-2$ checks
+signed decoding of its first lane as $-2$ and its last lane as 1. A
+zero-start range checks its last lane as 3. A singleton splat checks the
+insert branch with value 7. Adding a length-four splat of 7 to the negative
+range checks the final lane as 8 and exercises composition and the fill
+branch. Finally, adding singleton splats of $2^{32}-1$ and 1 checks a
+result of zero, demonstrating that the source arithmetic is modular.
+
+These six positive theorems complement rather than establish the universal
+result. For example, the wraparound case checks the chosen arithmetic
+interpretation, while the induction theorem already quantifies over every
+input word. No benchmark timing or performance comparison is asserted.
+
+\subsection{Two hypothetical incorrect translations}
+The first counterexample replaces the nonzero-start range lowering with
+bare index generation. At lane zero of the range beginning at $-2$, the
+bad target produces $\word{0}$ and the source produces $\word{-2}$.
+Their inequality is checked by \code{dropped_offset_counterexample}.
+This is a witness against an alternative mathematical translation, not
+an observed defect or mutation test run against the C++ compiler.
+
+The second uses singleton insertion for a length-four splat of 7. At lane
+one, the target returns the initial value 99 while the source returns 7.
+The inequality is checked by the theorem
+\begin{center}
+\code{oversized_insert_counterexample}.
+\end{center}
+It witnesses failure of equality for this environment; it does not say
+every environment would reveal the defect. If the unwritten contents
+happened already to be 7, this particular observation would not distinguish
+the translations. Universal quantification over initial contents is what
+rules out relying on that accident.
+
+\subsection{Domain rejection and coverage}
+Two further theorems prove that $V(0,0)$ and $V(2^{31}-1,2)$ are false.
+These are model-domain checks, not executions of the upstream verifier.
+Together with the six positive cases and two bad-lowering witnesses,
+they constitute ten checked example theorems. They do not measure coverage
+of the compiler codebase or prove completeness of the formal grammar.
+
+\subsection{Proof validation and assumptions}
+A clean \code{lake build} checked the library and examples. The command
+\begin{center}
+\code{lake env lean TTIRFormal/Audit.lean}
+\end{center}
+inspected the assumptions of the principal results. The local lowering
+results, universal preservation,
+target independence, and both bad-lowering witnesses report
+\code{propext} and \code{Quot.sound}. The two integer-bound results
+additionally report \code{Classical.choice}. These are standard Lean
+foundations, not new compiler axioms introduced by the artifact.
+
+The proof sources contain no \code{sorry}, \code{admit}, custom axiom
+declarations, or \code{native_decide} shortcuts. Tactics simplify
+equations, discharge finite examples, and solve arithmetic obligations;
+the reported evidence is successful proof checking, not a claim that
+the specification itself is independently validated. A proof assistant
+cannot determine whether a manually encoded denotation is the intended
+semantics of a separately implemented compiler.
+
+\section{Source Correspondence and Remaining Obligations}\label{sec:limits}
+Table~\ref{tab:source} records the inspected anchors. It is a correspondence
+map for audit, not a machine-checked refinement relation. The full revision
+is recorded in Section~\ref{sec:source} and in the accompanying findings.
+
+\begin{table}[t]
+\caption{Source anchors at the audited revision. Long directory prefixes
+are factored into the key below the table.}\label{tab:source}
+\centering
+\begin{tabularx}{\linewidth}{@{}lX@{}}
+\toprule
+Anchor & Inspected fact \\
+\midrule
+A: \code{TritonOps.td}:427 & Splat declaration and tensor result.\\
+A: \code{TritonOps.td}:854 & Rank-one i32 range; signed-accessor warning.\\
+B: \code{Ops.cpp}:407 & Nonempty interval, length, rank, and element verifier.\\
+C: \code{TritonOpConverter.cpp}:1145 & Generated indices and optional start offset.\\
+C: \code{TritonOpConverter.cpp}:1205 & Singleton insertion versus fill.\\
+C: \code{TritonOpConverter.cpp}:1350 & Broadcast collapse and possible match failure.\\
+D: \code{compiler.py}:324,1592 & Stage implementation and registration.\\
+\bottomrule
+\end{tabularx}
+\smallskip
+\begin{minipage}{\linewidth}\small
+A: \path{include/triton/Dialect/Triton/IR/};
+B: \path{lib/Dialect/Triton/IR/};\\
+C: \path{third_party/ascend/lib/TritonToLinalg/};
+D: \path{third_party/ascend/backend/}.
+\end{minipage}
+\end{table}
+
+\subsection{What is omitted from the patterns}
+The range converter records three attributes:
+\begin{itemize}
+\item \code{tt.from_make_range};
+\item \code{tt.make_range_offset};
+\item \code{tt.make_range_size}.
+\end{itemize}
+The model omits this metadata and does not prove that downstream
+transformations interpret it correctly. The splat converter inserts debug
+NOP anchors that are likewise omitted. Evaluation models result values,
+not every generated operation or diagnostic effect.
+
+We inspected broadcast but did not add it to the formal syntax. Its
+converter computes broadcast and unbroadcast dimensions, asks for collapse
+reassociation indices, and can fail matching. On success it constructs
+collapse-shape and broadcast operations. A proof would need to account
+for these shape helpers and success conditions rather than simply adding
+an unconditional replication equation. No broadcast theorem is claimed.
+
+\subsection{A layered correctness argument}
+The current evidence occupies only part of a potential end-to-end argument:
+\begin{enumerate}
+\item \emph{Source representation.} Establish that a concrete TTIR fragment
+is represented by a well-formed source expression with the same observations.
+This requires type, attribute, operand, and relevant layout correspondence.
+\item \emph{Abstract lowering.} Prove preservation by $\lo$. This is
+Theorem~\ref{thm:main}, completed for the stated grammar.
+\item \emph{Implementation correspondence.} Show that the actual converter
+implements $\lo$ under explicit assumptions, including index casts,
+allocation behavior, and pattern applicability. The present audit is
+informal evidence for this step, not a proof.
+\item \emph{Surrounding passes and execution.} Establish preservation
+through the remaining passes, bufferization, code generation, and execution.
+None of these steps is provided by this artifact.
+\end{enumerate}
+This decomposition explains why a short algebraic preservation proof can
+be useful without establishing a large systems claim. The small proof
+isolates exactly where the singleton guard and signed offset matter; the
+remaining work is to justify that these abstractions describe execution.
+
+\subsection{Threats to validity}
+The principal threat is specification error shared by both denotations.
+In particular, defining the source range by bit-vector addition makes
+its relation to the target transparent, but does not independently
+establish the full meaning of the upstream operation. The separate bounds
+and concrete signed examples mitigate only part of this issue. A general
+signed-decoding theorem and a verified representation relation would
+provide stronger evidence.
+
+The pure, total, shape-indexed representation intentionally eliminates
+several classes of real compiler behavior: malformed IR, dynamic shapes,
+SSA control flow, memory effects, masks, pointer arithmetic, aliasing,
+concurrency, and floating point. It also does not distinguish independent
+empty allocations or model poison. These omissions limit applicability;
+they are not conclusions that the omitted behaviors are safe.
+
+Finally, source inspection is revision-specific and does not automatically
+track future changes. The current artifact has no parser or automated
+source-to-model validator. Rechecking Lean after a compiler change cannot
+by itself establish that the source correspondence still holds.
+
+\section{Related Work}
+Triton introduced an intermediate language and compiler for tiled
+neural-network computations~\cite{triton}; our artifact is not a
+formalization of that entire programming model. It studies two patterns
+in a particular downstream checkout. MLIR provides extensible compiler
+infrastructure across abstraction levels~\cite{mlir}; our distinction
+between a mixed-IR stage and a single dialect follows the practical need
+to identify a narrower semantic boundary within such a pipeline. We do
+not supply a general framework for composing arbitrary dialect semantics.
+
+CompCert exemplifies machine-checked semantic preservation for a realistic
+compiler~\cite{compcert}. The present work uses the familiar structure
+of source and target semantics connected by a translation theorem, but
+has a far smaller language and lacks a verified connection to the actual
+C++ transformation. It should therefore not be read as an alternative
+end-to-end verified compiler.
+
+Alive2 addresses bounded translation validation for LLVM~\cite{alive2}.
+Our proof is universal over the encoded expression trees rather than
+validation of individual LLVM transformations, but the implementation
+boundary is weaker: we do not consume before-and-after compiler IR. The
+two bad-lowering witnesses are not a translation-validation engine. A
+future validator for the selected TTIR/target fragment could complement
+the model, provided parsing, unsupported cases, and the validation
+semantics were made explicit.
+
+Lean 4 supplies the dependent types, executable functions, and theorem
+proving infrastructure used here~\cite{lean4}. We exploit shape indices
+to constrain constructors and use function extensionality to reason
+about tensors. Our contribution is the source-specific case study,
+not a new foundational logic or dependent tensor representation. This
+discussion situates the artifact among compiler proofs and validation
+approaches; it is not a systematic novelty survey.
+
+\section{Conclusion}
+Two elementary-looking tensor conversions expose useful verification
+obligations: a singleton write must cover every valid lane, and range
+construction must retain the signed offset under finite-width arithmetic.
+The Lean core makes both obligations explicit and proves value preservation
+under arbitrary input and initial-content families. Its checked
+counterexamples distinguish plausible incorrect translations, while
+the axiom audit records the logical foundations of the principal results.
+
+The next steps are not larger claims about the same proof. They are
+additional evidence: a signed-decoding bridge, a concrete representation
+relation, a correspondence argument for the actual conversion patterns,
+and preservation through surrounding passes. The present artifact provides
+a small verified component and a precise account of what remains outside it.
+
+\section*{Artifact Availability}
+The accompanying \code{ttir-formalization} directory contains all Lean
+sources, a pinned toolchain, build configuration, and source-audit findings.
+From its root, \code{lake build} checks the library and examples;
+\code{lake env lean TTIRFormal/Audit.lean} prints the principal axiom
+dependencies. The paper resides in its \code{paper} subdirectory.
+No public archive DOI or independent artifact-evaluation result is claimed.
+The artifact does not require Ascend hardware, and no hardware performance
+or compiler-execution experiment is reported.
+
+\section*{Generative AI Disclosure}
+Generative AI assisted the development of the accompanying formalization
+and the drafting and editing of this manuscript. The reported mechanized
+results were checked with Lean. This draft requires author review of the
+scientific claims, source correspondence, and references before submission.
+AI assistance is not a substitute for that review or for authorship
+responsibility.
+
+\bibliography{references}
+\end{document}
